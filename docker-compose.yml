@@ -1,0 +1,14 @@
+services:
+  webchat:
+    build: .
+    ports:
+      - "127.0.0.1:4001:4001"
+    environment:
+      WEB_PASSWORD: ${WEB_PASSWORD:?请设置 WEB_PASSWORD}
+      NAPCAT_ACCESS_TOKEN: ${NAPCAT_ACCESS_TOKEN:?请设置 NAPCAT_ACCESS_TOKEN}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?请设置 PUBLIC_BASE_URL}
+      ADMIN_QQ_ID: ${ADMIN_QQ_ID:-}
+      CHAT_DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

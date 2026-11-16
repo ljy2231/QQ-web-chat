@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.sqlite3*
+*.db
+chat_data.json*
+settings.json*
+data/
+files/
+uploads/
+*.bak*
+*.log
