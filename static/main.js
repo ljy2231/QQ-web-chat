@@ -1098,6 +1098,10 @@ let ws = null;
                     h = '<div class="text-sm font-semibold text-gray-800 mb-2">黑名单设置</div>'
                       + '<p class="text-xs text-gray-400 mb-3">这些 QQ 号 / 群号的消息会被完全忽略（不回复、不转发）。多个用分号（;）分割。</p>'
                       + '<textarea id="set-blacklist" class="w-full h-40 border border-gray-300 rounded-lg p-3 text-sm outline-none focus:border-blue-500" placeholder="QQ ID">' + escapeAttr((settingsData.blacklist || []).join(';')) + '</textarea>';
+                } else if (tab === 'admin') {
+                    h = '<div class="text-sm font-semibold text-gray-800 mb-2">管理员设置</div>'
+                      + '<p class="text-xs text-gray-400 mb-3">管理员私聊可使用 = ALL ON/OFF、= CLEAR、= REBOOT；留空则禁用这些管理命令。</p>'
+                      + '<input id="set-admin-qq" type="text" inputmode="numeric" maxlength="20" class="w-full border border-gray-300 rounded-lg p-3 text-sm outline-none focus:border-blue-500" placeholder="管理员 QQ 号" value="' + escapeAttr(settingsData.admin_qq_id || '') + '">';
                 } else if (tab === 'background') {
                     var yes = settingsData.use_image_host !== false;
                     var chatBg = !!settingsData.chat_background;
@@ -1163,6 +1167,8 @@ let ws = null;
                     var a = document.getElementById('set-whitelist'); if (a) settingsData.whitelist = a.value.replace(/；/g, ';').split(';').map(function(id) { return id.trim(); }).filter(Boolean);
                 } else if (settingsTab === 'blacklist') {
                     var b = document.getElementById('set-blacklist'); if (b) settingsData.blacklist = b.value.replace(/；/g, ';').split(';').map(function(id) { return id.trim(); }).filter(Boolean);
+                } else if (settingsTab === 'admin') {
+                    var ad = document.getElementById('set-admin-qq'); if (ad) settingsData.admin_qq_id = ad.value.trim();
                 } else if (settingsTab === 'background') {
                     var r = document.querySelector('input[name="set-bg"]:checked');
                     if (r) settingsData.use_image_host = (r.value === 'yes');
@@ -1186,7 +1192,7 @@ let ws = null;
                 if (settingsData.revision === undefined) { showToast('设置缺少版本，拒绝覆盖，请重新加载'); return; }
                 var requestSession = authToken;
                 var payload = {revision: settingsData.revision};
-                var allowed = ['whitelist','blacklist','use_image_host','theme','theme_auto','dark_start','dark_end','chat_background','sound_enabled'];
+                var allowed = ['whitelist','blacklist','admin_qq_id','use_image_host','theme','theme_auto','dark_start','dark_end','chat_background','sound_enabled'];
                 allowed.forEach(function(key) {
                     if (JSON.stringify(settingsData[key]) !== JSON.stringify(savedSettings && savedSettings[key])) payload[key] = settingsData[key];
                 });

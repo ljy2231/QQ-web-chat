@@ -312,6 +312,34 @@ class MessagingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await self.s.process_inbound(blocked)
             self.assertEqual(len(calls), count)
 
+    async def test_admin_id_can_be_changed_from_settings(self):
+        await self.allow('12', '13')
+        # The environment value remains the fallback until a stored ID exists.
+        self.assertEqual(self.s.current_admin(), '12')
+        settings = await self.s.store.call('get_settings')
+        response = await self.http.post(self.base + '/api/settings',
+                                        json={'revision': settings['revision'], 'admin_qq_id': '13'},
+                                        headers={'Origin': self.base})
+        self.assertEqual(response.status, 200)
+        await response.read()
+        self.assertEqual(self.s.current_admin(), '13')
+        # The old ID loses the command; the new stored ID gains it.
+        await self.s.process_inbound(self.incoming(1, content='= ALL ON'))
+        self.assertFalse(await self.s.store.call('get_mode', 'private:12'))
+        other = self.incoming(2, content='= ALL ON')
+        other['sender']['user_id'] = 13
+        other['user_id'] = 13
+        await self.s.process_inbound(other)
+        self.assertTrue(await self.s.store.call('get_mode', 'private:13'))
+        # Invalid administrator IDs are rejected and do not replace the stored value.
+        current = await self.s.store.call('get_settings')
+        response = await self.http.post(self.base + '/api/settings',
+                                        json={'revision': current['revision'], 'admin_qq_id': 'not-a-number'},
+                                        headers={'Origin': self.base})
+        self.assertEqual(response.status, 400)
+        await response.read()
+        self.assertEqual(self.s.current_admin(), '13')
+
     async def test_durable_inbox_replay(self):
         await self.allow('12')
         event = self.incoming(11)

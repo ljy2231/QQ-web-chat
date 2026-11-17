@@ -230,4 +230,15 @@ test('request error paths settle exactly once and animation fallback exposes log
  assert.equal(h.nodes['login-card'].style.opacity,'1');assert.equal(h.nodes['login-card'].style.pointerEvents,'auto');
  h.run("currentTargetId='private:1';handleFileSelect({name:'bad.txt',size:5},false)");const upload=h.requests[h.requests.length-1];upload.onerror();assert.equal(h.run('pendingFile'),null);
 });
+test('admin settings tab renders, collects and submits the administrator ID',()=>{
+ const h=harness('main');
+ h.run("settingsTab='admin';settingsData={revision:4,admin_qq_id:''};renderSettingsTab('admin')");
+ assert.ok(h.nodes['settings-body'].innerHTML.includes('id="set-admin-qq"'));
+ assert.ok(h.nodes['settings-body'].innerHTML.includes('管理员'));
+ const input=h.node('input');input.id='set-admin-qq';input.value=' 12345 ';input.parentNode={};h.nodes['set-admin-qq']=input;
+ h.run('collectSettingsTab()');assert.equal(h.run('settingsData.admin_qq_id'),'12345');
+ h.run("settingsTab='admin';savedSettings={revision:4};settingsData={revision:4,admin_qq_id:'12345'};authToken='session-marker';saveSettings()");
+ const post=h.requests.filter(x=>x.url==='/api/settings'&&x.method==='POST').pop();
+ assert.equal(JSON.parse(post.body).admin_qq_id,'12345');
+});
 console.log('PASS '+count+' synthetic frontend tests (no browser/device assertions)');

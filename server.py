@@ -41,6 +41,7 @@ SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 DEFAULT_SETTINGS = {
     "whitelist": [],
     "blacklist": [],
+    "admin_qq_id": "",
     "use_image_host": True,
     "theme": "light",
     "theme_auto": False,
@@ -213,6 +214,14 @@ def public_settings():
         "sound_enabled": bool(settings.get("sound_enabled", True))
     }
 
+def current_admin():
+    """Settings value wins; the environment variable is the initial fallback."""
+    value = settings.get('admin_qq_id')
+    if isinstance(value, str) and re.fullmatch(r'[1-9][0-9]{0,19}', value):
+        return value
+    return ADMIN_QQ_ID
+
+
 async def ui_settings_handler(request):
     return web.json_response(public_settings())
 
@@ -220,7 +229,8 @@ async def settings_handler(request):
     sessions.require(request)
     if request.method == 'GET':
         result = await store.call('get_settings')
-        return web.json_response({**result['settings'], 'revision': result['revision']})
+        return web.json_response({**result['settings'], 'admin_qq_id': current_admin(),
+                                  'revision': result['revision']})
     data = await json_object(request)
     revision = data.get('revision')
     if not isinstance(revision, int) or isinstance(revision, bool):
@@ -237,6 +247,9 @@ async def settings_handler(request):
                     raise web.HTTPBadRequest()
                 value = clean_ids(value)
                 if len(value) > 10000 or any(not re.fullmatch(r'[1-9][0-9]{0,19}', x) for x in value):
+                    raise web.HTTPBadRequest()
+            elif key == 'admin_qq_id':
+                if not isinstance(value, str) or (value and not re.fullmatch(r'[1-9][0-9]{0,19}', value)):
                     raise web.HTTPBadRequest()
             elif isinstance(DEFAULT_SETTINGS[key], bool):
                 if not isinstance(value, bool):
@@ -867,7 +880,7 @@ async def process_inbound(data):
             await send_qq_api('send_private_msg', {'user_id': int(peer),
                                                    'message': f'你的ID:{sender_id} 当前未授权，请联系管理员授权'})
         return
-    command = all_command(content, kind, sender_id, ADMIN_QQ_ID)
+    command = all_command(content, kind, sender_id, current_admin())
     action = 'send_private_msg' if kind == 'private' else 'send_group_msg'
     params = {'user_id' if kind == 'private' else 'group_id': int(peer)}
     if command is not None:
@@ -882,7 +895,8 @@ async def process_inbound(data):
         await send_qq_api(action, {**params, 'message': tip})
         return
     if content.upper() in ('= CLEAR', '= REBOOT'):
-        if kind != 'private' or not ADMIN_QQ_ID or sender_id != ADMIN_QQ_ID:
+        admin = current_admin()
+        if kind != 'private' or not admin or sender_id != admin:
             return
         if content.upper() == '= CLEAR':
             await clear_history(target)
@@ -893,7 +907,8 @@ async def process_inbound(data):
         # Restore the original help menu; a leading command in a group gets no reply.
         if kind == 'group':
             return
-        if ADMIN_QQ_ID and sender_id == ADMIN_QQ_ID:
+        admin = current_admin()
+        if admin and sender_id == admin:
             help_text = '【指令菜单】\n= ALL 开启全量转发\n= CLEAR 清空聊天记录\n= REBOOT 重启服务器'
         else:
             help_text = '【指令菜单】\n= ALL 开启全量转发'

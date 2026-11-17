@@ -113,6 +113,10 @@ def _settings(value):
             for item in value[key]:
                 if not re.fullmatch(r"[1-9][0-9]{0,19}", _id(item)):
                     raise ValueError("invalid settings peer ID")
+    if "admin_qq_id" in value:
+        admin = value["admin_qq_id"]
+        if not isinstance(admin, str) or (admin and not re.fullmatch(r"[1-9][0-9]{0,19}", admin)):
+            raise ValueError("invalid administrator ID")
     for key in ("use_image_host", "theme_auto", "chat_background", "sound_enabled"):
         if key in value and not isinstance(value[key], bool):
             raise ValueError("invalid boolean setting")
