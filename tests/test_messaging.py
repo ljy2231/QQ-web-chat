@@ -247,6 +247,36 @@ class MessagingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.s.process_inbound(self.incoming(4, content='no prefix'))
         self.assertEqual((await self.s.store.call('history', 'private:12'))['messages'][0]['content'], 'no prefix')
 
+    async def test_private_receipt_and_equals_help_menu_unchanged(self):
+        self.s.ADMIN_QQ_ID = '12'
+        calls = []
+        async def fake(action, params):
+            calls.append((action, params.get('message')))
+        with patch.object(self.s, 'send_qq_api', fake):
+            await self.allow('12', '13')
+            # Forwarded private chat keeps the original receipt.
+            await self.s.process_inbound(self.incoming(1, content='= hello'))
+            self.assertEqual(calls[-1], ('send_private_msg', '[Web-QQ] 消息已转发到Web端'))
+            # A duplicate delivery is not acknowledged twice.
+            await self.s.process_inbound(self.incoming(1, content='= hello'))
+            self.assertEqual(len(calls), 1)
+            # Authorized group forwarding stays silent.
+            await self.s.process_inbound(self.incoming(2, kind='group', content='group hello'))
+            self.assertEqual((await self.s.store.call('history', 'group:12'))['messages'][0]['content'], 'group hello')
+            self.assertNotIn('send_group_msg', [action for action, _ in calls])
+            # The original help menu is restored verbatim.
+            await self.s.process_inbound(self.incoming(3, content='='))
+            self.assertEqual(calls[-1][1], '【指令菜单】\n= ALL 开启全量转发\n= CLEAR 清空聊天记录\n= REBOOT 重启服务器')
+            other = self.incoming(4, content='=')
+            other['sender']['user_id'] = 13
+            other['user_id'] = 13
+            await self.s.process_inbound(other)
+            self.assertEqual(calls[-1][1], '【指令菜单】\n= ALL 开启全量转发')
+            # A lone '=' in a group still gets no reply.
+            count = len(calls)
+            await self.s.process_inbound(self.incoming(5, kind='group', content='='))
+            self.assertEqual(len(calls), count)
+
     async def test_durable_inbox_replay(self):
         await self.allow('12')
         event = self.incoming(11)

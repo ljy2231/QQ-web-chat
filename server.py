@@ -884,7 +884,14 @@ async def process_inbound(data):
             shutdown_event.set()
         return
     if content == '=':
-        await send_qq_api(action, {**params, 'message': '私聊消息需 = 前缀；管理员可使用 = ALL ON/OFF、= CLEAR、= REBOOT'})
+        # Restore the original help menu; a leading command in a group gets no reply.
+        if kind == 'group':
+            return
+        if ADMIN_QQ_ID and sender_id == ADMIN_QQ_ID:
+            help_text = '【指令菜单】\n= ALL 开启全量转发\n= CLEAR 清空聊天记录\n= REBOOT 重启服务器'
+        else:
+            help_text = '【指令菜单】\n= ALL 开启全量转发'
+        await send_qq_api(action, {**params, 'message': help_text})
         return
     if kind == 'private' and not await store.call('get_mode', target):
         # A reply segment does not bypass the forwarding prefix.
@@ -921,6 +928,9 @@ async def process_inbound(data):
         schedule_media({'target_id': target, 'message_id': result['message']['message_id']})
         if kind == 'group' and contact['name'] == peer:
             schedule_media({'contact': contact})
+        # Restore the original private-only forwarded receipt; groups stay silent.
+        if kind == 'private':
+            await send_qq_api(action, {**params, 'message': '[Web-QQ] 消息已转发到Web端'})
 
 
 async def inbox_worker():
