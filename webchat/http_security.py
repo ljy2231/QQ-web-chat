@@ -1,3 +1,4 @@
+import re
 """Bounded HTTP admission and response headers. No production-specific settings."""
 import asyncio
 from aiohttp import web
@@ -43,9 +44,12 @@ async def response_headers(request, response):
     if request.path in ('/web', '/web/nr'):
         response.headers.setdefault('Cache-Control', 'no-store')
         response.headers.setdefault('X-Frame-Options', 'DENY')
+        # Old Android WebViews do not treat 'self' as covering the wss: scheme.
+        host = request.host if re.fullmatch(r'[A-Za-z0-9.:\[\]-]+', request.host or '') else None
+        ws_sources = (' ws://' + host + ' wss://' + host) if host else ' ws: wss:'
         response.headers.setdefault('Content-Security-Policy',
             "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' blob: data: https:; media-src 'self' blob:; connect-src 'self'; "
+            "img-src 'self' blob: data: https:; media-src 'self' blob:; connect-src 'self'" + ws_sources + "; "
             "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
     if request.path.startswith('/api/'):
         response.headers.setdefault('Cache-Control', 'no-store')
