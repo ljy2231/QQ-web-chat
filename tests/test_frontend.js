@@ -250,4 +250,21 @@ test('admin settings tab renders, collects and submits the administrator ID',()=
  const post=h.requests.filter(x=>x.url==='/api/settings'&&x.method==='POST').pop();
  assert.equal(JSON.parse(post.body).admin_qq_id,'12345');
 });
+test('NR image viewer opens from a thumbnail, zooms with buttons and closes',()=>{
+ const h=harness('nr');
+ assert.ok(!h.nodes['nrViewer'].style.display);
+ const thumb=h.node('img');thumb.setAttribute('src','/files/synthetic.png');
+ h.nodes['messages'].events.click({target:thumb});
+ assert.equal(h.nodes['nrViewer'].style.display,'block');
+ assert.equal(h.run('nrView.scale'),1);
+ h.run('nrZoomIn()');assert.ok(h.run('nrView.scale')>1);
+ for(let i=0;i<10;i++)h.run('nrZoomIn()');
+ assert.equal(h.run('nrView.scale'),5);
+ assert.equal(h.nodes['nrZoomIn'].disabled,true);
+ assert.equal(h.nodes['nrZoomOut'].disabled,false);
+ h.run('nrSetScale(1)');assert.equal(h.nodes['nrZoomOut'].disabled,true);
+ h.run("nrStartDrag(10,10,{tagName:'div'})");h.run('nrMoveDrag(90,60)');
+ assert.equal(h.run('nrView.tx'),80);assert.equal(h.run('nrView.ty'),50);
+ h.nodes['nrViewerClose'].click();assert.equal(h.nodes['nrViewer'].style.display,'none');
+});
 console.log('PASS '+count+' synthetic frontend tests (no browser/device assertions)');

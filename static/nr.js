@@ -2,7 +2,8 @@
 var session = null, connection = null, myQQ = null, contacts = {}, currentId = null, currentType = null;
 var pendingFile = null, currentXHR = null, quoteMsg = null, store = new ChatCore.Store();
 var composing = false, historyTimer = null, sessionRequest = null, sessionGeneration = 0, logoutGeneration = 0, logoutPending = false;
-var NR_BUILD = 'NR v4';
+var NR_BUILD = 'NR v5';
+var nrView = {open: false, scale: 1, tx: 0, ty: 0}, nrDrag = null, NR_MIN_SCALE = 1, NR_MAX_SCALE = 5, NR_ZOOM_STEP = 1.35;
 var wsToken = null;
 try { wsToken = window.sessionStorage.getItem('nr_ws_token'); } catch (ignore) {}
 function $(id) { return document.getElementById(id); }
@@ -251,4 +252,111 @@ try { localStorage.removeItem('webchat_token'); } catch (ignore) {}
         else if (status === 0) $('loginErr').textContent = '会话检查超时，请重新登录';
     });
 }());
+
+/* 图片查看器：单指拖动、按钮缩放，兼容旧 WebView */
+function nrIsImage(el) { return !!(el && el.tagName && String(el.tagName).toLowerCase() === 'img'); }
+function nrApplyView() {
+    var img = $('nrViewerImg');
+    if (!img) return;
+    var t = 'translate(-50%,-50%) translate(' + nrView.tx + 'px,' + nrView.ty + 'px) scale(' + nrView.scale + ')';
+    img.style.webkitTransform = t; img.style.transform = t;
+}
+function nrClampView() {
+    var stage = $('nrViewerStage'), img = $('nrViewerImg');
+    if (!stage || !img) return;
+    var sw = stage.clientWidth, sh = stage.clientHeight, iw = img.clientWidth, ih = img.clientHeight;
+    if (!(sw > 0 && sh > 0 && iw > 0 && ih > 0)) return;
+    var mx = Math.max(0, (iw * nrView.scale - sw) / 2), my = Math.max(0, (ih * nrView.scale - sh) / 2);
+    if (nrView.tx > mx) nrView.tx = mx; if (nrView.tx < -mx) nrView.tx = -mx;
+    if (nrView.ty > my) nrView.ty = my; if (nrView.ty < -my) nrView.ty = -my;
+}
+function nrUpdateViewButtons() {
+    var zin = $('nrZoomIn'), zout = $('nrZoomOut');
+    if (zin) zin.disabled = nrView.scale >= NR_MAX_SCALE - 0.001;
+    if (zout) zout.disabled = nrView.scale <= NR_MIN_SCALE + 0.001;
+}
+function nrSetScale(s) {
+    if (s < NR_MIN_SCALE) s = NR_MIN_SCALE;
+    if (s > NR_MAX_SCALE) s = NR_MAX_SCALE;
+    nrView.scale = s; nrClampView(); nrApplyView(); nrUpdateViewButtons();
+}
+function nrZoomIn() { nrSetScale(nrView.scale * NR_ZOOM_STEP); }
+function nrZoomOut() { nrSetScale(nrView.scale / NR_ZOOM_STEP); }
+function nrOpenImage(src) {
+    if (!src) return;
+    nrView.open = true; nrView.scale = 1; nrView.tx = 0; nrView.ty = 0; nrDrag = null;
+    var tip = $('nrViewerTip'); if (tip) tip.textContent = '单指拖动查看 · 点图片外区域关闭';
+    var img = $('nrViewerImg');
+    if (img) {
+        img.onerror = function () { var t = $('nrViewerTip'); if (t) t.textContent = '图片加载失败，请检查网络'; };
+        img.src = src;
+    }
+    var v = $('nrViewer');
+    if (v) { v.style.display = 'block'; v.setAttribute('aria-hidden', 'false'); }
+    nrApplyView(); nrUpdateViewButtons();
+}
+function nrCloseImage() {
+    nrView.open = false; nrDrag = null;
+    var v = $('nrViewer');
+    if (v) { v.style.display = 'none'; v.setAttribute('aria-hidden', 'true'); }
+    var img = $('nrViewerImg'); if (img) img.removeAttribute('src');
+}
+function nrStartDrag(cx, cy, target) {
+    if (!nrView.open) return;
+    nrDrag = {x: cx, y: cy, tx: nrView.tx, ty: nrView.ty, moved: false, onImage: nrIsImage(target)};
+}
+function nrMoveDrag(cx, cy) {
+    if (!nrDrag || !nrView.open) return false;
+    var dx = cx - nrDrag.x, dy = cy - nrDrag.y;
+    if (!nrDrag.moved && (Math.abs(dx) > 8 || Math.abs(dy) > 8)) nrDrag.moved = true;
+    nrView.tx = nrDrag.tx + dx; nrView.ty = nrDrag.ty + dy;
+    nrClampView(); nrApplyView();
+    return true;
+}
+function nrEndDrag() {
+    if (!nrDrag) return;
+    var d = nrDrag; nrDrag = null;
+    if (!d.moved && !d.onImage) nrCloseImage();
+}
+function nrBindViewer() {
+    var box = $('messages'), stage = $('nrViewerStage');
+    if (!box || !stage) return;
+    box.addEventListener('click', function (e) {
+        e = e || window.event;
+        var t = e.target || e.srcElement;
+        while (t && t !== box) {
+            if (nrIsImage(t)) { nrOpenImage(t.getAttribute('src') || t.src); return; }
+            t = t.parentNode;
+        }
+    }, false);
+    stage.addEventListener('touchstart', function (e) {
+        if (e.touches && e.touches.length !== 1) { nrDrag = null; return; }
+        var t = e.touches ? e.touches[0] : e;
+        nrStartDrag(t.clientX, t.clientY, e.target || e.srcElement);
+        if (e.preventDefault) e.preventDefault();
+    }, false);
+    stage.addEventListener('touchmove', function (e) {
+        if (!nrView.open || !e.touches || e.touches.length !== 1) return;
+        if (e.preventDefault) e.preventDefault();
+        nrMoveDrag(e.touches[0].clientX, e.touches[0].clientY);
+    }, false);
+    stage.addEventListener('touchend', nrEndDrag, false);
+    stage.addEventListener('touchcancel', function () { nrDrag = null; }, false);
+    stage.addEventListener('mousedown', function (e) {
+        e = e || window.event;
+        if (e.button !== undefined && e.button !== 0) return;
+        nrStartDrag(e.clientX, e.clientY, e.target || e.srcElement);
+    }, false);
+    stage.addEventListener('mousemove', function (e) {
+        e = e || window.event;
+        if (e.buttons === 0) { nrDrag = null; return; }
+        nrMoveDrag(e.clientX, e.clientY);
+    }, false);
+    if (document.addEventListener) document.addEventListener('mouseup', function () { nrEndDrag(); }, false);
+    $('nrZoomIn').onclick = nrZoomIn;
+    $('nrZoomOut').onclick = nrZoomOut;
+    $('nrViewerClose').onclick = nrCloseImage;
+}
+nrBindViewer();
+
 updateStatus(); updateComposer();
