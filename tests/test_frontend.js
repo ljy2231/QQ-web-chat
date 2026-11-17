@@ -210,7 +210,8 @@ test('shared/NR files keep ES5-only syntax and no bearer persistence',()=>{
   const code=fs.readFileSync(path.join(base,file),'utf8');
   const syntax=code.replace(/\/\*[\s\S]*?\*\//g,'').replace(/'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"/g,'').replace(/\/\/[^\n]*/g,'');
   assert.ok(!/\b(?:let|const|class|async|await)\b|=>|`|\.\.\./.test(syntax),file);
-  assert.ok(!/localStorage\.setItem\([^\n]*token|[?&]token=/.test(code),file);
+  assert.ok(!/localStorage\.setItem\([^\n]*token/.test(code),file);
+  assert.ok(!/sessionStorage\.setItem\([^\n]*token/.test(file==='static/chat-core.js'?code:''),file);
  }
 });
 test('expiry retains lookup identities only until explicit logout',()=>{

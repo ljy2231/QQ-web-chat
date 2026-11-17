@@ -312,6 +312,34 @@ class MessagingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await self.s.process_inbound(blocked)
             self.assertEqual(len(calls), count)
 
+    async def test_old_webview_websocket_token_fallback(self):
+        response = await self.http.post(self.base + '/api/login',
+                                        json={'password': 'synthetic-password'},
+                                        headers={'Origin': self.base})
+        self.assertEqual(response.status, 200)
+        token = (await response.json())['token']
+        # Old Android WebViews omit cookies on WebSocket upgrades; a valid session
+        # token in the query must still admit the socket without a cookie jar.
+        jar = aiohttp.DummyCookieJar()
+        async with aiohttp.ClientSession(cookie_jar=jar) as client:
+            ws = await client.ws_connect(self.base + '/client_ws?token=' + token,
+                                         headers={'Origin': self.base})
+            try:
+                async with asyncio.timeout(4):
+                    while True:
+                        message = await ws.receive()
+                        if message.type == WSMsgType.TEXT and json.loads(message.data).get('type') == 'status':
+                            break
+            finally:
+                await ws.close()
+        async with aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar()) as anonymous:
+            with self.assertRaises(aiohttp.WSServerHandshakeError):
+                await anonymous.ws_connect(self.base + '/client_ws?token=invalid-token-value',
+                                           headers={'Origin': self.base})
+            with self.assertRaises(aiohttp.WSServerHandshakeError):
+                await anonymous.ws_connect(self.base + '/client_ws?token=' + token,
+                                           headers={'Origin': 'https://wrong.invalid'})
+
     async def test_admin_id_can_be_changed_from_settings(self):
         await self.allow('12', '13')
         # The environment value remains the fallback until a stored ID exists.

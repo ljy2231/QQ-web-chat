@@ -190,7 +190,9 @@
         this.socket = null;
         this.state = 'connecting'; this.napcat = null; this.qq = null; this.publish();
         var socket;
-        try { socket = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/client_ws'); }
+        var wsURL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/client_ws';
+        if (this.options.token) wsURL += '?token=' + encodeURIComponent(this.options.token);
+        try { socket = new WebSocket(wsURL); }
         catch (ignore) { this.retry(); return; }
         this.socket = socket;
         this.last = Date.now();

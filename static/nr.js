@@ -2,6 +2,8 @@
 var session = null, connection = null, myQQ = null, contacts = {}, currentId = null, currentType = null;
 var pendingFile = null, currentXHR = null, quoteMsg = null, store = new ChatCore.Store();
 var composing = false, historyTimer = null, sessionRequest = null, sessionGeneration = 0, logoutGeneration = 0, logoutPending = false;
+var wsToken = null;
+try { wsToken = window.sessionStorage.getItem('nr_ws_token'); } catch (ignore) {}
 function $(id) { return document.getElementById(id); }
 function esc(s) { return String(s === null || s === undefined ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 function notice(text) { $('feedback').textContent = text; }
@@ -19,16 +21,20 @@ function doLogin() {
     sessionGeneration += 1; var generation = sessionGeneration;
     if (sessionRequest) sessionRequest.abort();
     $('loginBtn').disabled = true; $('loginErr').textContent = '验证中…';
-    sessionRequest = ChatCore.request('POST', '/api/login', {password: $('pwd').value}, function(status) {
+    sessionRequest = ChatCore.request('POST', '/api/login', {password: $('pwd').value}, function(status, data) {
         if (generation !== sessionGeneration) return;
         sessionRequest = null; $('loginBtn').disabled = false;
-        if (status === 200) enterSession();
+        if (status === 200) {
+            if (data && data.token) { wsToken = data.token; try { window.sessionStorage.setItem('nr_ws_token', wsToken); } catch (ignore) {} }
+            enterSession();
+        }
         else $('loginErr').textContent = status === 0 ? '登录超时或网络错误，请重试' : '登录失败，请检查密码或稍后重试';
     });
 }
 function clearSession(text, preserveLookups) {
     var nextStore = preserveLookups ? store.recoverable() : new ChatCore.Store();
-    sessionGeneration += 1; session = null;
+    sessionGeneration += 1; session = null; wsToken = null;
+    try { window.sessionStorage.removeItem('nr_ws_token'); } catch (ignore) {}
     if (sessionRequest) sessionRequest.abort(); sessionRequest = null;
     if (connection) connection.stop(); connection = null;
     clearTimeout(historyTimer); cancelFile(); quoteMsg = null; contacts = {}; store = nextStore;
@@ -51,6 +57,7 @@ function connect() {
     if (!session) return;
     if (!window.WebSocket) { notice('浏览器不支持 WebSocket；NR 需要 WebSocket 支持'); return; }
     if (!connection) connection = new ChatCore.Connection({
+        token: wsToken,
         status: updateStatus,
         open: function() { store.refreshResults(connection); if (currentId) requestHistory(); },
         event: handle,

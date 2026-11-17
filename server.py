@@ -1311,7 +1311,18 @@ async def initialize_client(ws, owner):
 
 
 async def client_ws_handler(request):
-    owner = sessions.require(request, websocket=True)
+    owner = sessions.authenticate(request, websocket=True)
+    if owner is None:
+        # Some old Android WebViews do not attach cookies to a WebSocket upgrade.
+        # Accept an active session token in the query for this handshake only;
+        # the access logger records route templates, never query strings.
+        token = request.query.get('token')
+        candidate = sessions.sessions.get(token) if isinstance(token, str) else None
+        if sessions.is_active(candidate, touch=True):
+            sessions.check_origin(request, required=False)
+            owner = candidate
+    if owner is None:
+        raise web.HTTPUnauthorized()
     ws = web.WebSocketResponse(max_msg_size=CLIENT_FRAME_BYTES, heartbeat=30)
     await ws.prepare(request)
     resource = 'ws:' + secrets.token_hex(16)
