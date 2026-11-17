@@ -1,4 +1,12 @@
 import asyncio
+import signal
+from pathlib import Path
+from webchat.storage import AsyncStore, RevisionConflict, StorageBusy
+from webchat.auth import SessionManager, SafeAccessLogger, json_object, load_credentials
+from webchat.resources import DiskBudget, io_safely
+from webchat.http_security import security_middleware, response_headers
+from webchat.messaging import (conversation_key, parse_target, normalize_segments,
+                               inbox_key, validate_client_message, validate_request_id, all_command)
 import copy
 import sqlite3
 from contextlib import closing
@@ -51,7 +59,39 @@ DB_FILE = os.path.join(DATA_DIR, "chat_storage.sqlite3")
 UPLOAD_DIR = os.path.join(DATA_DIR, "files")
 
 # 保存有效的登录 Token
-active_tokens = set()
+TEMPLATE_DIR = Path(__file__).resolve().parent / 'templates'
+PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', '').rstrip('/')
+sessions = SessionManager(WEB_PASSWORD, public_base_url=PUBLIC_BASE_URL,
+                          trusted_proxies=tuple(x.strip() for x in os.environ.get('TRUSTED_PROXIES', '').split(',') if x.strip()))
+store = None
+background_tasks = set()
+shutdown_event = asyncio.Event()
+inbox_available = asyncio.Event()
+media_queue = asyncio.Queue(maxsize=128)
+DISCLOSE_CLIENT_IP = os.environ.get('DISCLOSE_CLIENT_IP', '').lower() in ('1', 'true', 'yes')
+ready = False
+# Upload authority is separate from the public, expiring delivery capability.
+upload_bindings = {}
+UPLOAD_BINDING_LIMIT = 4096
+UPLOAD_TTL = 7 * 86400
+
+
+def spawn(coro):
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+    def finished(done):
+        background_tasks.discard(done)
+        if not done.cancelled() and done.exception() is not None:
+            logger.error('background task failed: %s', type(done.exception()).__name__)
+    task.add_done_callback(finished)
+    return task
+
+
+def status_event():
+    return {'type': 'status', 'connected': state.napcat_connected and state.qq_online,
+            'napcat_connected': state.napcat_connected, 'qq_online': state.qq_online,
+            'self_id': state.self_id}
+
 
 HTML_404 = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -109,8 +149,11 @@ async def error_middleware(request, handler):
         if response.status == 404:
             return web.Response(text=HTML_404, content_type='text/html', charset='utf-8', status=404)
         return response
+    except StorageBusy:
+        return web.json_response({'error': 'durable storage capacity; retry later'}, status=503,
+                                 headers={'Retry-After': '5'})
     except web.HTTPException as ex:
-        if ex.status in [400, 403, 404, 405]:
+        if ex.status == 404 and not request.path.startswith('/api/'):
             return web.Response(text=HTML_404, content_type='text/html', charset='utf-8', status=404)
         raise
 
@@ -124,7 +167,7 @@ class ServerState:
         self.messages = {}
         self.lock = asyncio.Lock()
         self.settings_lock = asyncio.Lock()
-        self.is_all_mode = False
+        self.qq_online = False
 
 state = ServerState()
 pending_requests = {}
@@ -139,68 +182,16 @@ CLIENT_QUEUE_BYTES = 16 * 1024 * 1024
 DRAIN_TIMEOUT = 10.0
 client_senders = {}
 
-def _open_storage():
-    # Restrict newly-created database and SQLite sidecars to the service user.
-    fd = os.open(DB_FILE, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError('invalid database file')
-        os.fchmod(fd, 0o600)
-    finally:
-        os.close(fd)
-    db = sqlite3.connect(DB_FILE, timeout=30)
-    try:
-        db.execute("PRAGMA busy_timeout = 30000")
-        return db
-    except BaseException:
-        db.close()
-        raise
 
 
-def init_storage():
-    # One transaction imports both legacy files; malformed input aborts startup.
-    with closing(_open_storage()) as db, db:
-        db.execute("CREATE TABLE IF NOT EXISTS storage (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        db.execute("BEGIN IMMEDIATE")
-        if db.execute("SELECT 1 FROM storage WHERE key = 'initialized'").fetchone():
-            return
-        data = {"contacts": {}, "messages": {}}
-        imported_settings = {}
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict) or not isinstance(data.get("contacts", {}), dict) or not isinstance(data.get("messages", {}), dict):
-                raise ValueError("invalid legacy chat data")
-        if os.path.exists(SETTINGS_FILE):
-            with open(SETTINGS_FILE, encoding="utf-8") as f:
-                imported_settings = json.load(f)
-            if not isinstance(imported_settings, dict):
-                raise ValueError("invalid legacy settings")
-        for key, value in (("data", {"contacts": data.get("contacts", {}), "messages": data.get("messages", {})}),
-                           ("settings", imported_settings), ("initialized", True)):
-            db.execute("INSERT INTO storage(key, value) VALUES (?, ?)", (key, json.dumps(value, ensure_ascii=False)))
 
 
-def _read_storage(key):
-    with closing(_open_storage()) as db, db:
-        row = db.execute("SELECT value FROM storage WHERE key = ?", (key,)).fetchone()
-    if row is None:
-        raise RuntimeError("storage is not initialized")
-    return json.loads(row[0])
 
 
-def _write_storage(key, value):
-    encoded = json.dumps(value, ensure_ascii=False)
-    with closing(_open_storage()) as db, db:
-        db.execute("INSERT INTO storage(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, encoded))
 
 
-def load_settings():
-    settings.update(_read_storage("settings"))
 
 
-def save_settings(value):
-    _write_storage("settings", value)
 
 def clean_ids(value):
     if isinstance(value, str):
@@ -226,74 +217,43 @@ async def ui_settings_handler(request):
     return web.json_response(public_settings())
 
 async def settings_handler(request):
-    if request.method == "GET":
-        if request.query.get("token") not in active_tokens:
-            return web.json_response({"error": "unauthorized"}, status=401)
-        return web.json_response(settings)
-    try:
-        data = await request.json()
-    except Exception:
-        return web.json_response({"error": "bad request"}, status=400)
-    if data.get("token") not in active_tokens:
-        return web.json_response({"error": "unauthorized"}, status=401)
+    sessions.require(request)
+    if request.method == 'GET':
+        result = await store.call('get_settings')
+        return web.json_response({**result['settings'], 'revision': result['revision']})
+    data = await json_object(request)
+    revision = data.get('revision')
+    if not isinstance(revision, int) or isinstance(revision, bool):
+        return web.json_response({'error': 'revision required'}, status=400)
     async with state.settings_lock:
-        updated = dict(settings)
-        updated["whitelist"] = clean_ids(data.get("whitelist", updated.get("whitelist", [])))
-        updated["blacklist"] = clean_ids(data.get("blacklist", updated.get("blacklist", [])))
-        updated["use_image_host"] = bool(data.get("use_image_host", updated.get("use_image_host", True)))
-        updated["theme"] = "dark" if data.get("theme") == "dark" else "light"
-        updated["theme_auto"] = bool(data.get("theme_auto", False))
-        updated["dark_start"] = str(data.get("dark_start") or "20:00")
-        updated["dark_end"] = str(data.get("dark_end") or "07:00")
-        updated["chat_background"] = bool(data.get("chat_background", updated.get("chat_background", False)))
-        updated["sound_enabled"] = bool(data.get("sound_enabled", updated.get("sound_enabled", True)))
-        # Do not let cancellation release the lock while a worker can still commit.
-        task = asyncio.create_task(asyncio.to_thread(save_settings, updated))
-        cancelled = False
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                cancelled = True
-        task.result()
+        current = await store.call('get_settings')
+        updated = dict(current['settings'])
+        for key in DEFAULT_SETTINGS:
+            if key not in data:
+                continue
+            value = data[key]
+            if key in ('whitelist', 'blacklist'):
+                if not isinstance(value, (str, list)):
+                    raise web.HTTPBadRequest()
+                value = clean_ids(value)
+                if len(value) > 10000 or any(not re.fullmatch(r'[1-9][0-9]{0,19}', x) for x in value):
+                    raise web.HTTPBadRequest()
+            elif isinstance(DEFAULT_SETTINGS[key], bool):
+                if not isinstance(value, bool):
+                    raise web.HTTPBadRequest()
+            elif not isinstance(value, str) or len(value) > 100:
+                raise web.HTTPBadRequest()
+            updated[key] = value
+        try:
+            result = await store.call('save_settings', updated, revision)
+        except RevisionConflict:
+            return web.json_response({'error': 'settings changed; reload'}, status=409)
         settings.clear()
-        settings.update(updated)
-        if cancelled:
-            raise asyncio.CancelledError
-        return web.json_response({"ok": True, "settings": settings})
+        settings.update(result['settings'])
+        return web.json_response({'ok': True, 'settings': {**settings, 'revision': result['revision']}, 'revision': result['revision']})
 
-def load_data():
-    data = _read_storage("data")
-    state.contacts = data.get("contacts", {})
-    state.messages = data.get("messages", {})
 
-async def update_chat(mutator):
-    async with state.lock:
-        candidate = copy.deepcopy({"contacts": state.contacts, "messages": state.messages})
-        events = mutator(candidate)
-        if not events:
-            return
-        data = json.dumps(candidate, ensure_ascii=False)
-        task = asyncio.create_task(asyncio.to_thread(_write_data_encoded, data))
-        cancelled = False
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                cancelled = True
-        task.result()
-        state.contacts = candidate["contacts"]
-        state.messages = candidate["messages"]
-        for event in events:
-            await broadcast_to_clients(event)
-        if cancelled:
-            raise asyncio.CancelledError
 
-def _write_data_encoded(encoded):
-    with closing(_open_storage()) as db, db:
-        cursor = db.execute("UPDATE storage SET value = ? WHERE key = 'data'", (encoded,))
-        if cursor.rowcount != 1:
-            raise RuntimeError("chat storage is not initialized")
 
 async def client_sender(ws, queue):
     try:
@@ -322,12 +282,24 @@ def remove_client_sender(ws):
         sender[1].cancel()
 
 
-async def queue_client_message(ws, message):
+async def queue_client_message(ws, message, backpressure=False):
     sender = client_senders.get(ws)
     if sender is None or ws.closed:
         return False
     payload = json.dumps(message, ensure_ascii=False)
     size = len(payload.encode("utf-8"))
+    if backpressure and size <= CLIENT_FRAME_BYTES:
+        try:
+            async with asyncio.timeout(BROADCAST_TIMEOUT):
+                while sender[0].full() or sender[0].bytes_used + size > CLIENT_QUEUE_BYTES:
+                    if ws.closed or sender[1].done():
+                        return False
+                    await asyncio.sleep(0.001)
+                sender[0].put_nowait((payload, size))
+                sender[0].bytes_used += size
+                return True
+        except TimeoutError:
+            pass
     if size > CLIENT_FRAME_BYTES or sender[0].bytes_used + size > CLIENT_QUEUE_BYTES:
         logger.warning("oversized client message; disconnecting")
     else:
@@ -348,41 +320,36 @@ async def queue_client_message(ws, message):
 
 async def broadcast_to_clients(message: dict):
     # Queue insertion is synchronous before the first await in the normal case.
-    await asyncio.gather(*(queue_client_message(ws, message) for ws in list(state.clients)))
+    await asyncio.gather(*(queue_client_message(ws, message) for ws in list(state.clients)
+                           if sessions.is_active(client_owners.get(ws), touch=False)))
 
 async def send_history(ws, target_id):
-    message = {"type": "history_data", "target_id": target_id,
-               "messages": state.messages.get(target_id, [])}
-    # Do not truncate silently or disconnect in a reconnect loop.
-    if len(json.dumps(message, ensure_ascii=False).encode("utf-8")) > CLIENT_FRAME_BYTES:
-        await queue_client_message(ws, {"type": "toast", "content": "聊天记录过大，无法显示，请联系管理员"})
-        return
-    await queue_client_message(ws, message)
+    validate_client_message({'type': 'get_history', 'target_id': target_id})
+    async with state.lock:
+        snapshot = await store.call('history', target_id)
+        message = {'type': 'history_data', **snapshot}
+        if len(json.dumps(message, ensure_ascii=False).encode()) > CLIENT_FRAME_BYTES:
+            await queue_client_message(ws, {'type': 'toast', 'content': '聊天记录超过8MiB，无法显示；没有截断历史'})
+            return
+        await queue_client_message(ws, message)
 
-async def save_message(target_id, msg_data, contact=None, quote_id=None):
-    def mutate(data):
-        events = []
-        if contact is not None and target_id not in data["contacts"]:
-            data["contacts"][target_id] = copy.deepcopy(contact)
-            events.append({"type": "contact_add", "contact": data["contacts"][target_id]})
-        message = copy.deepcopy(msg_data)
-        if quote_id:
-            original = next((m for m in reversed(data["messages"].get(target_id, []))
-                             if str(m.get("message_id")) == str(quote_id)), None)
-            message["quote"] = ({"id": original.get("message_id"), "sender_name": original.get("sender_name"), "content": original.get("content")}
-                                if original else {"id": quote_id, "sender_name": "未知", "content": "[找不到原消息]"})
-        messages = data["messages"].setdefault(target_id, [])
-        messages.append(message)
-        del messages[:-200]
-        events.append({"type": "message", **message})
-        return events
-    await update_chat(mutate)
+async def save_message(target_id, msg_data, contact=None, quote_id=None, quote_id_kind='internal'):
+    async with state.lock:
+        result = await store.call('append_message', target_id, msg_data, contact=contact,
+                                  quote_id=quote_id, quote_id_kind=quote_id_kind,
+                                  platform_ids=msg_data.get('napcat_message_ids'))
+        if not result['inserted']:
+            return result
+        if result.get('contact'):
+            state.contacts[target_id] = result['contact']
+            await broadcast_to_clients({'type': 'contact_add', 'contact': result['contact'], 'revision': result['revision']})
+        await broadcast_to_clients({'type': 'message', **result['message'], 'revision': result['revision']})
+        return result
 
 async def clear_history(target_id):
-    def mutate(data):
-        data["messages"][target_id] = []
-        return [{"type": "clear_history", "target_id": target_id}]
-    await update_chat(mutate)
+    async with state.lock:
+        result = await store.call('clear_history', target_id)
+        await broadcast_to_clients({'type': 'clear_history', **result})
 
 async def send_qq_api_and_wait(action, params, timeout=120.0):
     ws = state.napcat_ws
@@ -392,9 +359,11 @@ async def send_qq_api_and_wait(action, params, timeout=120.0):
     future = asyncio.get_running_loop().create_future()
     pending_requests[echo] = (ws, future)
     try:
-        await ws.send_json({"action": action, "params": params, "echo": echo})
-        return await asyncio.wait_for(future, timeout=timeout)
-    except (asyncio.TimeoutError, ConnectionError, RuntimeError):
+        # A single deadline includes transport backpressure, not just the echo wait.
+        async with asyncio.timeout(timeout):
+            await ws.send_json({'action': action, 'params': params, 'echo': echo})
+            return await future
+    except (TimeoutError, ConnectionError, RuntimeError, aiohttp.ClientError):
         return None
     finally:
         pending_requests.pop(echo, None)
@@ -410,18 +379,29 @@ def fail_pending_for(ws):
                 future.set_result(None)
 
 async def send_qq_api(action, params):
-    if state.napcat_ws and not state.napcat_ws.closed:
-        payload = {"action": action, "params": params, "echo": f"api_{datetime.now().timestamp()}"}
-        await state.napcat_ws.send_json(payload)
+    # Even fire-and-forget commands have a bounded transport wait.
+    ws = state.napcat_ws
+    if ws is not None and not ws.closed:
+        try:
+            async with asyncio.timeout(5):
+                await ws.send_json({'action': action, 'params': params, 'echo': secrets.token_urlsafe(24)})
+        except (TimeoutError, ConnectionError, RuntimeError, aiohttp.ClientError):
+            pass
 
 MAX_TRANSFER = 50 * 1024 * 1024
 remote_slots = asyncio.Semaphore(4)
 wallpaper_slots = asyncio.Semaphore(2)
 upload_slots = asyncio.Semaphore(4)
+attachment_budget = DiskBudget(UPLOAD_DIR,
+    max_bytes=int(os.environ.get('ATTACHMENT_MAX_BYTES', str(1024 * 1024 * 1024))),
+    min_free=int(os.environ.get('MIN_FREE_BYTES', str(512 * 1024 * 1024))),
+    max_files=int(os.environ.get('ATTACHMENT_MAX_FILES', '10000')))
 
 def public_ip(value):
     ip = ipaddress.ip_address(value)
-    return ip.is_global and (not isinstance(ip, ipaddress.IPv6Address) or ip.ipv4_mapped is None or ip.ipv4_mapped.is_global)
+    mapped = ip.ipv4_mapped if isinstance(ip, ipaddress.IPv6Address) else None
+    return (ip.is_global and not ip.is_multicast and
+            (mapped is None or (mapped.is_global and not mapped.is_multicast)))
 
 class PublicResolver(aiohttp.abc.AbstractResolver):
     def __init__(self):
@@ -477,8 +457,7 @@ async def _safe_fetch(url, limit=MAX_TRANSFER):
         raise ValueError('too many redirects')
 
 def authenticated(request):
-    token = request.cookies.get('webchat_token') or request.headers.get('Authorization', '').removeprefix('Bearer ')
-    return token in active_tokens
+    return sessions.authenticate(request) is not None
 
 def safe_upload_path(path):
     if not isinstance(path, str):
@@ -538,160 +517,119 @@ async def wallpaper_handler(request):
     except (ValueError, OSError, aiohttp.ClientError, asyncio.TimeoutError):
         return web.json_response({'error': 'Wallpaper download failed'}, status=502)
 
-async def logout_handler(request):
-    try:
-        data = await request.json()
-    except Exception:
-        data = {}
-    active_tokens.discard(data.get("token"))
-    response = web.json_response({"ok": True})
-    response.del_cookie("webchat_token")
-    return response
 
-async def login_handler(request):
-    data = await request.json()
-    pw = str(data.get("password") or "")
-    pw_hash = str(data.get("password_hash") or "")
-    if pw == WEB_PASSWORD or pw_hash == WEB_PASSWORD_HASH:
-        token = secrets.token_urlsafe(32)
-        active_tokens.add(token)
-        response = web.json_response({"status": "ok", "token": token})
-        response.set_cookie("webchat_token", token, httponly=True, samesite="Strict", secure=request.secure or request.headers.get("X-Forwarded-Proto") == "https")
-        return response
-    return web.json_response({"status": "error", "msg": "密码错误"}, status=401)
 
-async def restore_handler(request):
-    try:
-        data = await request.json()
-        token = data.get('token')
-    except Exception:
-        return web.Response(status=400)
-    if token not in active_tokens:
-        return web.Response(status=401)
-    response = web.json_response({'ok': True})
-    response.set_cookie('webchat_token', token, httponly=True, samesite='Strict', secure=request.secure or request.headers.get('X-Forwarded-Proto') == 'https')
-    return response
 
 bridge_sessions = {}
 BRIDGE_SESSION_LIMIT = 64
 BRIDGE_QUEUE_LIMIT = 128
-BRIDGE_QUEUE_BYTES = 16 * 1024 * 1024
-BRIDGE_TOTAL_BYTES = 64 * 1024 * 1024
-BRIDGE_FRAME_BYTES = 8 * 1024 * 1024
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-bridge_connecting = 0
+BRIDGE_TOTAL_BYTES = 8 * 1024 * 1024
+BRIDGE_FRAME_BYTES = CLIENT_FRAME_BYTES
+
+
+class BridgeSocket:
+    """Internal transport: no loopback credential URLs or second WS size limit."""
+    def __init__(self):
+        self.closed = False
+        self.queue = asyncio.Queue(maxsize=BRIDGE_QUEUE_LIMIT)
+        self.queue.bytes_used = 0
+        self.available = asyncio.Event()
+
+    async def send_str(self, payload):
+        size = len(payload.encode())
+        total = sum(s['ws'].queue.bytes_used for s in bridge_sessions.values())
+        if size > BRIDGE_FRAME_BYTES or total + size > BRIDGE_TOTAL_BYTES or self.queue.full():
+            await self.close()
+            raise ConnectionError('bridge buffer limit')
+        self.queue.put_nowait((payload, size))
+        self.queue.bytes_used += size
+        self.available.set()
+
+    async def close(self, **kwargs):
+        self.closed = True
+        self.available.set()
+        state.clients.discard(self)
+        client_owners.pop(self, None)
+        remove_client_sender(self)
+
+
+async def close_bridge(sid):
+    item = bridge_sessions.pop(sid, None)
+    if item:
+        await item['ws'].close()
+        sessions.unbind(item['owner'], sid)
+
 
 async def bridge_connect_handler(request):
-    data = await request.json()
-    token = data.get("token")
-    if token not in active_tokens:
-        return web.json_response({"error": "unauthorized"}, status=401)
-    global bridge_connecting
-    if len(bridge_sessions) + bridge_connecting >= BRIDGE_SESSION_LIMIT:
-        return web.json_response({"error": "bridge capacity"}, status=503)
-    bridge_connecting += 1
+    owner = sessions.require(request)
+    await json_object(request)
+    if len(bridge_sessions) >= BRIDGE_SESSION_LIMIT:
+        return web.json_response({'error': 'bridge capacity'}, status=503)
     sid = secrets.token_urlsafe(16)
-    session = aiohttp.ClientSession()
+    ws = BridgeSocket()
+    if not sessions.bind(owner, sid, lambda: close_bridge(sid)):
+        return web.json_response({'error': 'session capacity'}, status=503)
+    bridge_sessions[sid] = {'ws': ws, 'owner': owner, 'last': time.monotonic(), 'polling': False}
     try:
-        ws = await session.ws_connect("http://127.0.0.1:4001/client_ws?token=" + token)
+        await initialize_client(ws, owner)
     except BaseException:
-        await session.close()
+        await close_bridge(sid)
         raise
-    finally:
-        bridge_connecting -= 1
-    queue = asyncio.Queue(maxsize=BRIDGE_QUEUE_LIMIT)
-    queue.bytes_used = 0
-    available = asyncio.Event()
-    async def reader():
-        try:
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    size = len(msg.data.encode('utf-8'))
-                    if (size > BRIDGE_FRAME_BYTES or queue.bytes_used + size > BRIDGE_QUEUE_BYTES or
-                            sum(s['queue'].bytes_used for s in bridge_sessions.values()) + size > BRIDGE_TOTAL_BYTES):
-                        logger.warning("bridge queue byte limit exceeded; disconnecting")
-                        break
-                    try:
-                        queue.put_nowait((msg.data, size))
-                        queue.bytes_used += size
-                        available.set()
-                    except asyncio.QueueFull:
-                        logger.warning("bridge queue full; disconnecting")
-                        break
-        except Exception:
-            pass
-        finally:
-            # Keep buffered messages available until the poller drains them.
-            s = bridge_sessions.get(sid)
-            if s is not None:
-                s["closed"] = True
-            available.set()
-            await ws.close()
-            await session.close()
-    task = asyncio.create_task(reader())
-    bridge_sessions[sid] = {"ws": ws, "queue": queue, "available": available, "task": task, "session": session, "last": time.monotonic()}
-    return web.json_response({"session": sid})
+    return web.json_response({'session': sid})
+
+
+def owned_bridge(request, sid):
+    owner = sessions.require(request)
+    if not isinstance(sid, str):
+        raise web.HTTPBadRequest()
+    item = bridge_sessions.get(sid)
+    if item is None or item['owner'] is not owner:
+        raise web.HTTPNotFound()
+    item['last'] = time.monotonic()
+    return item
+
 
 async def bridge_poll_handler(request):
-    sid = request.query.get("session")
-    s = bridge_sessions.get(sid)
-    if not s:
-        return web.json_response({"error": "no session"}, status=404)
-    if s.get("polling"):
-        return web.json_response({"error": "poll already active"}, status=409)
-    s["polling"] = True
-    s["last"] = time.monotonic()
+    item = owned_bridge(request, request.query.get('session'))
+    if item['polling']:
+        return web.json_response({'error': 'poll already active'}, status=409)
+    item['polling'] = True
+    ws = item['ws']
     messages = []
     try:
-        # Wait without removing data: cancellation leaves the queue unchanged.
-        if s['queue'].empty() and not s.get('closed'):
-            s['available'].clear()
+        if ws.queue.empty() and not ws.closed:
+            ws.available.clear()
             try:
-                await asyncio.wait_for(s['available'].wait(), timeout=2.0)
-            except asyncio.TimeoutError:
+                await asyncio.wait_for(ws.available.wait(), 2)
+            except TimeoutError:
                 pass
-        # One frame per response bounds the batch without reordering or loss.
-        if not messages and not s['queue'].empty():
-            item, size = s['queue'].get_nowait()
-            s['queue'].bytes_used -= size
-            s['queue'].task_done()
-            messages.append(item)
+        if not sessions.is_active(item['owner']):
+            raise web.HTTPUnauthorized()
+        if not ws.queue.empty():
+            payload, size = ws.queue.get_nowait()
+            ws.queue.bytes_used -= size
+            ws.queue.task_done()
+            messages.append(payload)
+        return web.json_response({'messages': messages, 'closed': ws.closed and ws.queue.empty()})
     finally:
-        s["polling"] = False
-        s["last"] = time.monotonic()
-    closed = bool(s.get("closed") and s["queue"].empty())
-    if closed and bridge_sessions.get(sid) is s:
-        bridge_sessions.pop(sid, None)
-    return web.json_response({"messages": messages, "closed": closed})
+        item['polling'] = False
+
 
 async def bridge_send_handler(request):
-    data = await request.json()
-    s = bridge_sessions.get(data.get("session"))
-    if not s or s["ws"].closed:
-        return web.json_response({"error": "no session"}, status=404)
-    s["last"] = time.monotonic()
-    try:
-        await s["ws"].send_json(data.get("payload"))
-    except Exception:
-        return web.json_response({"error": "send failed"}, status=502)
-    return web.json_response({"ok": True})
+    data = await json_object(request, max_bytes=CLIENT_FRAME_BYTES)
+    item = owned_bridge(request, data.get('session'))
+    if item['ws'].closed:
+        raise web.HTTPGone()
+    await handle_client_payload(item['ws'], data.get('payload'), item['owner'], sessions.client_ip(request))
+    return web.json_response({'ok': True})
+
 
 async def bridge_cleanup():
     while True:
-        now = time.monotonic()
-        for sid, s in list(bridge_sessions.items()):
-            if not s.get("polling") and now - s["last"] > 300:
-                bridge_sessions.pop(sid, None)
-                try:
-                    await s["ws"].close()
-                except Exception:
-                    pass
-                s["task"].cancel()
-                try:
-                    await s["session"].close()
-                except Exception:
-                    pass
-        await asyncio.sleep(60)
+        for sid, item in list(bridge_sessions.items()):
+            if not sessions.is_active(item['owner']) or time.monotonic() - item['last'] > 300:
+                await close_bridge(sid)
+        await asyncio.sleep(30)
 
 async def upload_handler(request):
     if not authenticated(request):
@@ -701,7 +639,8 @@ async def upload_handler(request):
     except asyncio.TimeoutError:
         return web.json_response({'error': 'busy'}, status=503)
     try:
-        return await asyncio.wait_for(_upload_handler(request), timeout=120)
+        async with attachment_budget.reserve(MAX_TRANSFER):
+            return await asyncio.wait_for(_upload_handler(request), timeout=120)
     except asyncio.TimeoutError:
         return web.json_response({'error': 'upload timed out'}, status=408)
     finally:
@@ -710,12 +649,45 @@ async def upload_handler(request):
 async def _upload_handler(request):
     if not authenticated(request):
         return web.json_response({'error': 'unauthorized'}, status=401)
+    owner = sessions.require(request)
     filepath = None
     try:
+        now = time.time()
+        for path, binding in list(upload_bindings.items()):
+            if binding['expires'] <= now or not sessions.is_active(binding['owner']):
+                upload_bindings.pop(path, None)
+        if len(upload_bindings) >= UPLOAD_BINDING_LIMIT:
+            return web.json_response({'error': 'upload capacity'}, status=503)
         reader = await request.multipart()
+        target = request.headers.get('X-Conversation-ID')
+        upload_id = request.headers.get('X-Upload-ID') or request.headers.get('X-Request-ID')
         field = await reader.next()
+        # Identity fields must precede the file, avoiding unbounded multipart buffering.
+        for _ in range(4):
+            if field is None or field.name in ('image', 'file'):
+                break
+            if field.name not in ('target_id', 'upload_id', 'request_id'):
+                raise ValueError('invalid upload field')
+            raw = bytearray()
+            while True:
+                chunk = await field.read_chunk()
+                if not chunk:
+                    break
+                raw.extend(chunk)
+                if len(raw) > 256:
+                    raise ValueError('upload identity too large')
+            value = raw.decode('utf-8')
+            if field.name == 'target_id':
+                target = value
+            else:
+                upload_id = value
+            field = await reader.next()
+        parse_target(target)
+        validate_request_id(upload_id)
         if not field or field.name not in ('image', 'file'):
-            return web.json_response({'error': 'Invalid field'}, status=400)
+            raise ValueError('invalid file field')
+        if any(b['owner'] is owner and b['upload_id'] == upload_id for b in upload_bindings.values()):
+            raise ValueError('upload identity reused')
         orig_name = os.path.basename((field.filename or 'file').replace('\\', '/'))
         ext = os.path.splitext(orig_name)[1]
         if not re.fullmatch(r'\.[a-zA-Z0-9]{1,10}', ext):
@@ -731,8 +703,13 @@ async def _upload_handler(request):
                 size += len(chunk)
                 if size > MAX_TRANSFER:
                     raise ValueError('file too large')
-                f.write(chunk)
-        return web.json_response({'url': '/files/' + filename, 'local_path': filepath, 'orig_name': orig_name})
+                await io_safely(f.write, chunk)
+        if not sessions.is_active(owner):
+            raise ValueError('session expired')
+        upload_bindings[filepath] = {'owner': owner, 'target_id': target, 'upload_id': upload_id,
+                                     'expires': time.time() + UPLOAD_TTL, 'request_id': None}
+        return web.json_response({'url': '/files/' + filename, 'local_path': filepath,
+                                  'orig_name': orig_name, 'upload_id': upload_id, 'target_id': target})
     except BaseException as exc:
         if filepath and os.path.isfile(filepath):
             os.unlink(filepath)
@@ -747,10 +724,11 @@ async def cache_remote_image(url):
         if not body or ctype not in extensions:
             return None
         filename = uuid.uuid4().hex + extensions[ctype]
-        with open(os.path.join(UPLOAD_DIR, filename), 'xb') as f:
-            f.write(body)
+        async with attachment_budget.reserve(len(body)):
+            with open(os.path.join(UPLOAD_DIR, filename), 'xb') as f:
+                await io_safely(f.write, body)
         return '/files/' + filename
-    except (ValueError, OSError, aiohttp.ClientError, asyncio.TimeoutError):
+    except (ValueError, OSError, aiohttp.ClientError, asyncio.TimeoutError, web.HTTPInsufficientStorage):
         return None
 
 async def download_handler(request):
@@ -779,225 +757,233 @@ async def cleanup_old_files():
         await asyncio.sleep(3600)
 
 async def refresh_contacts_meta():
-    snapshot = copy.deepcopy(state.contacts)
-    async def fetch(cid, contact):
-        if contact.get("type") != "group":
-            return None
+    for contact in list(state.contacts.values()):
+        if contact.get('type') == 'group':
+            schedule_media({'contact': contact})
+
+def schedule_media(job):
+    try:
+        media_queue.put_nowait(job)
+    except asyncio.QueueFull:
+        # Optional enrichment never delays or discards the durable message.
+        pass
+
+
+async def media_worker():
+    while True:
+        job = await media_queue.get()
         try:
-            resp = await send_qq_api_and_wait("get_group_info", {"group_id": int(cid)})
-        except (ValueError, TypeError):
-            return None
-        if resp and resp.get("status") == "ok" and isinstance(resp.get("data"), dict):
-            return resp["data"].get("group_name")
-        return None
-    names = await asyncio.gather(*(fetch(cid, contact) for cid, contact in snapshot.items()))
-    def mutate(data):
-        events = []
-        for (cid, old), name in zip(snapshot.items(), names):
-            contact = data["contacts"].get(cid)
-            if not contact or contact.get("type") != old.get("type"):
-                continue
-            avatar = f"https://p.qlogo.cn/gh/{cid}/{cid}/100" if old.get("type") == "group" else f"https://q.qlogo.cn/headimg_dl?dst_uin={cid}&spec=100"
-            changed = False
-            if contact.get("avatar") == old.get("avatar") and contact.get("avatar") != avatar:
-                contact["avatar"] = avatar
-                changed = True
-            if name and contact.get("name") == old.get("name") and contact.get("name") != name:
-                contact["name"] = name
-                changed = True
-            if changed:
-                events.append({"type": "contact_add", "contact": contact})
-        return events
-    await update_chat(mutate)
+            async with asyncio.timeout(65):
+                contact = job.get('contact')
+                if contact:
+                    response = await send_qq_api_and_wait('get_group_info', {'group_id': int(contact['peer_id'])}, timeout=8)
+                    if isinstance(response, dict) and isinstance(response.get('data'), dict):
+                        name = response['data'].get('group_name')
+                        if isinstance(name, str) and name:
+                            async with state.lock:
+                                contact = {**contact, 'name': name[:256]}
+                                result = await store.call('upsert_contact', contact)
+                                state.contacts[contact['id']] = contact
+                                await broadcast_to_clients({'type': 'contact_add', 'contact': contact, 'revision': result['revision']})
+                else:
+                    target, mid = job['target_id'], job['message_id']
+                    current = await store.call('get_message', target, mid)
+                    if not current or current.get('is_recalled'):
+                        continue
+                    segments = copy.deepcopy(current.get('segments', []))
+                    changed = False
+                    for segment in segments:
+                        if segment.get('type') == 'file' and not segment.get('url') and segment.get('file_id'):
+                            kind, peer = parse_target(target)
+                            params = {'file_id': segment['file_id']}
+                            if kind == 'group':
+                                params['group_id'] = int(peer)
+                                if segment.get('busid') is not None:
+                                    params['busid'] = segment['busid']
+                            response = await send_qq_api_and_wait('get_group_file_url' if kind == 'group' else 'get_private_file_url', params, timeout=8)
+                            if isinstance(response, dict) and isinstance(response.get('data'), dict):
+                                from webchat.messaging import public_url
+                                url = public_url(response['data'].get('url'))
+                                if url:
+                                    segment['url'] = url
+                                    changed = True
+                        if segment.get('type') == 'image' and str(segment.get('url') or '').startswith(('http://', 'https://')):
+                            cached = await cache_remote_image(segment['url'])
+                            if cached:
+                                segment['url'] = cached
+                                changed = True
+                    if changed:
+                        async with state.lock:
+                            file = next((x for x in segments if x.get('type') == 'file'), {})
+                            result = await store.call('update_message', target, mid, {
+                                'segments': segments,
+                                'media_url': next((x['url'] for x in segments if x.get('type') == 'image' and x.get('url')), None),
+                                'file_url': file.get('url'), 'file_name': file.get('name'),
+                                'file_size': file.get('size')})
+                            if result.get('message'):
+                                await broadcast_to_clients({'type': 'message_updated', **result['message'], 'revision': result['revision']})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning('optional media metadata update failed')
+        finally:
+            media_queue.task_done()
+
+
+async def process_inbound(data):
+    if data.get('post_type') == 'notice' and data.get('notice_type') in ('offline_file', 'group_upload'):
+        # File notices have no message segments; convert them without losing their identity.
+        kind = 'group' if data['notice_type'] == 'group_upload' else 'private'
+        file = data.get('file')
+        if not isinstance(file, dict):
+            raise ValueError('invalid file notice')
+        sender_id = data.get('user_id')
+        identity = 'file_' + hashlib.sha256(inbox_key(data).encode()).hexdigest()[:32]
+        data = {**data, 'post_type': 'message', 'message_type': kind, 'message_id': identity,
+                '_file_notice': True, 'sender': {'user_id': sender_id, 'nickname': str(sender_id)},
+                'message': [{'type': 'file', 'data': {**file, 'file_id': file.get('id') or file.get('file_id'),
+                                                      'file_size': file.get('size') or file.get('file_size')}}]}
+    if data.get('post_type') == 'notice' and data.get('notice_type') in ('friend_recall', 'group_recall'):
+        kind = 'group' if data['notice_type'] == 'group_recall' else 'private'
+        target = conversation_key(kind, data.get('group_id') if kind == 'group' else data.get('user_id'))
+        await handle_recall(target, data.get('message_id'), platform_id=True)
+        return
+    if data.get('post_type') != 'message' or data.get('message_type') not in ('private', 'group'):
+        return
+    kind = data['message_type']
+    sender = data.get('sender')
+    if not isinstance(sender, dict):
+        raise ValueError('invalid sender')
+    sender_id = str(sender.get('user_id') or data.get('user_id') or '')
+    peer = str(data.get('group_id')) if kind == 'group' else sender_id
+    target = conversation_key(kind, peer)
+    segments, content, quote_id = normalize_segments(data.get('message', ''))
+    blacklist = set(settings.get('blacklist', []))
+    if peer in blacklist or sender_id in blacklist or peer not in set(settings.get('whitelist', [])):
+        return
+    command = all_command(content, kind, sender_id, ADMIN_QQ_ID)
+    action = 'send_private_msg' if kind == 'private' else 'send_group_msg'
+    params = {'user_id' if kind == 'private' else 'group_id': int(peer)}
+    if command is not None:
+        if isinstance(command, bool):
+            await store.call('set_mode', target, command)
+            tip = '当前会话全量转发已' + ('开启' if command else '关闭')
+        elif command == 'help':
+            enabled = await store.call('get_mode', target)
+            tip = '当前会话全量转发：' + ('ON' if enabled else 'OFF') + '；使用 = ALL ON 或 = ALL OFF'
+        else:
+            tip = '仅管理员私聊可使用此命令'
+        await send_qq_api(action, {**params, 'message': tip})
+        return
+    if content.upper() in ('= CLEAR', '= REBOOT'):
+        if kind != 'private' or not ADMIN_QQ_ID or sender_id != ADMIN_QQ_ID:
+            return
+        if content.upper() == '= CLEAR':
+            await clear_history(target)
+        else:
+            shutdown_event.set()
+        return
+    if content == '=':
+        await send_qq_api(action, {**params, 'message': '私聊消息需 = 前缀；管理员可使用 = ALL ON/OFF、= CLEAR、= REBOOT'})
+        return
+    if kind == 'private' and not await store.call('get_mode', target):
+        # A reply segment does not bypass the forwarding prefix.
+        if not content.startswith('='):
+            return
+        content = content[1:].strip()
+        for segment in segments:
+            if segment['type'] == 'text':
+                segment['text'] = segment['text'].lstrip()
+                if segment['text'].startswith('='):
+                    segment['text'] = segment['text'][1:].lstrip()
+                break
+    if not content:
+        return
+    platform = data.get('message_id')
+    if not isinstance(platform, (str, int)) or isinstance(platform, bool):
+        raise ValueError('invalid platform message id')
+    # Deterministic internal ID remains stable across inbox replay and duplicate QQ events.
+    mid = 'in_' + hashlib.sha256((target + ':' + str(platform)).encode()).hexdigest()[:32]
+    name = str(sender.get('card') or sender.get('nickname') or sender_id)[:256]
+    contact = state.contacts.get(target) or {'id': target, 'peer_id': peer, 'type': kind,
+               'name': name if kind == 'private' else peer,
+               'avatar': f'https://p.qlogo.cn/gh/{peer}/{peer}/100' if kind == 'group' else f'https://q.qlogo.cn/headimg_dl?dst_uin={peer}&spec=100'}
+    message = {'message_id': mid, 'target_id': target, 'sender_id': sender_id,
+               'sender_name': name, 'direction': 'incoming', 'content': content,
+               'segments': segments, 'napcat_message_ids': [] if data.get('_file_notice') else [str(platform)],
+               'media_url': next((x['url'] for x in segments if x['type'] == 'image' and x.get('url')), None),
+               'file_url': next((x.get('url') for x in segments if x['type'] == 'file'), None),
+               'file_name': next((x.get('name') for x in segments if x['type'] == 'file'), None),
+               'file_size': next((x.get('size') for x in segments if x['type'] == 'file'), None),
+               'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    result = await save_message(target, message, contact, quote_id, quote_id_kind='platform')
+    if result['inserted']:
+        schedule_media({'target_id': target, 'message_id': result['message']['message_id']})
+        if kind == 'group' and contact['name'] == peer:
+            schedule_media({'contact': contact})
+
+
+async def inbox_worker():
+    while True:
+        inbox_available.clear()
+        batch = await store.call('pending_inbox', limit=32)
+        if not batch:
+            await inbox_available.wait()
+            continue
+        for row in batch:
+            try:
+                await process_inbound(row['event'])
+            except asyncio.CancelledError:
+                raise  # durable pending row is replayed at startup
+            except (ValueError, TypeError, KeyError):
+                await store.call('finish_inbox', row['id'], error='invalid event schema')
+            except Exception:
+                logger.error('durable inbox processing failed; retained for retry')
+                await asyncio.sleep(1)
+                break
+            else:
+                await store.call('finish_inbox', row['id'])
+
 
 async def napcat_ws_handler(request):
     if request.headers.get('Upgrade', '').lower() != 'websocket':
-        return web.Response(text=HTML_404, content_type='text/html', charset='utf-8', status=404)
-
-    ws = web.WebSocketResponse(max_msg_size=NAPCAT_FRAME_BYTES)
+        raise web.HTTPNotFound()
+    token = request.headers.get('Authorization', '').removeprefix('Bearer ') or request.query.get('access_token', '')
+    if not EXPECTED_TOKEN or not secrets.compare_digest(token, EXPECTED_TOKEN):
+        raise web.HTTPUnauthorized()
+    ws = web.WebSocketResponse(max_msg_size=NAPCAT_FRAME_BYTES, heartbeat=30)
     await ws.prepare(request)
-
-    if EXPECTED_TOKEN:
-        token = request.query.get("access_token") or request.headers.get("Authorization", "").replace("Bearer ", "")
-        if token != EXPECTED_TOKEN:
-            await ws.close(code=1008, message=b"Invalid token")
-            return ws
-
-    # Close the currently active connection before waiting for its drain.
-    old_ws = state.napcat_ws
-    if old_ws is not None and old_ws is not ws:
-        fail_pending_for(old_ws)
-        await old_ws.close()
+    old = state.napcat_ws
+    if old is not None:
+        fail_pending_for(old)
+        try:
+            await asyncio.wait_for(old.close(), 2)
+        except TimeoutError:
+            pass
     try:
         await asyncio.wait_for(napcat_transition_lock.acquire(), DRAIN_TIMEOUT + 2)
-    except asyncio.TimeoutError:
-        await ws.close(code=1013, message=b"connection busy")
+    except TimeoutError:
+        await ws.close(code=1013, message=b'connection busy')
         return ws
-    state.napcat_ws = ws
-    state.napcat_connected = True
-    state.self_id = None
-
-    queue = asyncio.Queue(maxsize=NAPCAT_QUEUE_LIMIT)
-    queue.bytes_used = 0
-
-    async def worker():
-        while True:
-            data, event_size = await queue.get()
-            try:
-                post_type = data.get("post_type")
-
-                if post_type == "meta_event" and data.get("meta_event_type") == "heartbeat":
-                    status = data.get("status", {})
-                    if not status.get("online", True):
-                        await broadcast_to_clients({"type": "status", "connected": False, "error": "QQ掉线"})
-                        continue
-
-                if post_type == "notice" and data.get("notice_type") == "bot_offline":
-                    await broadcast_to_clients({"type": "status", "connected": False, "error": "QQ掉线"})
-                    continue
-
-                if post_type == "notice" and data.get("notice_type") in ["friend_recall", "group_recall"]:
-                    target_id = str(data.get("user_id")) if data.get("notice_type") == "friend_recall" else str(data.get("group_id"))
-                    await handle_recall(target_id, data.get("message_id"))
-                    continue
-
-                if post_type == "message" and data.get("message_type") in ["private", "group"]:
-                    msg_type = data.get("message_type")
-                    sender = data.get("sender", {})
-                    sender_uin = str(sender.get("user_id") or "")
-                    message_id = data.get("message_id")
-
-                    if msg_type == "private":
-                        target_id = str(sender.get("user_id"))
-                        name = sender.get("nickname", "未知用户")
-                        reply_action = "send_private_msg"
-                        reply_params = {"user_id": int(target_id)}
-                    else:
-                        target_id = str(data.get("group_id"))
-                        name = sender.get("card") or sender.get("nickname") or "群成员"
-                        reply_action = "send_group_msg"
-                        reply_params = {"group_id": int(target_id)}
-
-                    raw_msg = data.get("message", "")
-                    text_content = ""
-                    media_url = None
-                    file_name = None
-                    file_size = 0
-                    file_url = None
-                    file_id = None
-                    quote_id = None
-
-                    if isinstance(raw_msg, list):
-                        for m in raw_msg:
-                            m_type = m.get("type")
-                            m_data = m.get("data", {})
-                            if m_type == "text": text_content += m_data.get("text", "")
-                            elif m_type == "reply": quote_id = m_data.get("id")
-                            elif m_type in ["image", "mface"]:
-                                text_content += "[图片]"
-                                if not media_url:
-                                    raw_media = m_data.get("url") or m_data.get("file")
-                                    media_url = raw_media
-                            elif m_type == "file":
-                                file_name = os.path.basename(str(m_data.get("name") or m_data.get("file") or "文件"))
-                                try:
-                                    file_size = int(m_data.get("file_size") or 0)
-                                except (TypeError, ValueError):
-                                    file_size = 0
-                                file_url = m_data.get("url") or None
-                                file_id = m_data.get("file_id") or None
-                                text_content += f"[文件] {file_name}"
-                            elif m_type == "face": text_content += "[表情]"
-                    else:
-                        text_content = str(raw_msg)
-
-                    text_content = text_content.strip()
-                    if not text_content: continue
-
-                    blacklist = set(str(x) for x in settings.get("blacklist", []))
-                    whitelist = set(str(x) for x in settings.get("whitelist", []))
-                    if target_id in blacklist or sender_uin in blacklist:
-                        continue
-                    if target_id not in whitelist:
-                        if msg_type == "private" and text_content.startswith("="):
-                            await send_qq_api(reply_action, {**reply_params, "message": f"你的ID:{sender_uin} 当前未授权，请联系管理员授权"})
-                        continue
-
-                    upper_content = text_content.upper()
-
-                    if not quote_id:
-                        if text_content == "=":
-                            if msg_type == "group":
-                                continue
-                            if sender_uin == ADMIN_QQ_ID:
-                                help_text = "【指令菜单】\n= ALL 开启全量转发\n= CLEAR 清空聊天记录\n= REBOOT 重启服务器"
-                            else:
-                                help_text = "【指令菜单】\n= ALL 开启全量转发"
-                            await send_qq_api(reply_action, {**reply_params, "message": help_text})
-                            continue
-                        elif upper_content == "= ALL":
-                            state.is_all_mode = not state.is_all_mode
-                            tip = f"私聊全量转发已{'开启' if state.is_all_mode else '关闭'}"
-                            await send_qq_api(reply_action, {**reply_params, "message": tip})
-                            continue
-                        elif upper_content == "= CLEAR":
-                            if not ADMIN_QQ_ID or sender_uin != ADMIN_QQ_ID:
-                                continue
-                            await clear_history(target_id)
-                            await send_qq_api(reply_action, {**reply_params, "message": "聊天记录已清空"})
-                            continue
-                        elif upper_content == "= REBOOT":
-                            if not ADMIN_QQ_ID or sender_uin != ADMIN_QQ_ID:
-                                continue
-                            await send_qq_api(reply_action, {**reply_params, "message": "服务正在重启..."})
-                            await asyncio.sleep(1)
-                            os._exit(0)
-
-                        if not state.is_all_mode and msg_type != "group":
-                            if not text_content.startswith("="): continue
-                            else: text_content = text_content[1:].strip()
-
-                        if not text_content: continue
-
-                    if media_url:
-                        media_url = (await cache_remote_image(media_url)) or media_url
-
-                    contact_name = name
-                    if msg_type == "group" and target_id not in state.contacts:
-                        info = await send_qq_api_and_wait("get_group_info", {"group_id": int(target_id)})
-                        gname = info.get("data", {}).get("group_name") if (info and isinstance(info.get("data"), dict)) else None
-                        contact_name = gname or target_id
-                    avatar = f"https://p.qlogo.cn/gh/{target_id}/{target_id}/100" if msg_type == "group" else f"https://q.qlogo.cn/headimg_dl?dst_uin={target_id}&spec=100"
-                    contact = {"id": target_id, "name": contact_name, "type": msg_type, "avatar": avatar}
-
-                    msg_obj = {
-                        "message_id": message_id, "target_id": target_id, "sender_name": name,
-                        "content": text_content, "media_url": media_url, "quote": None,
-                        "file_name": file_name, "file_size": file_size, "file_url": file_url, "file_id": file_id,
-                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    }
-                    await save_message(target_id, msg_obj, contact, quote_id)
-
-                    if msg_type == "private":
-                        await send_qq_api(reply_action, {**reply_params, "message": "[Web-QQ] 消息已转发到Web端"})
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("NapCat event processing failed")
-            finally:
-                queue.bytes_used -= event_size
-                queue.task_done()
-
-    async def fetch_login_info():
-        resp = await send_qq_api_and_wait("get_login_info", {})
-        if state.napcat_ws is ws and resp and resp.get("status") == "ok":
-            state.self_id = resp.get("data", {}).get("user_id")
-            await broadcast_to_clients({"type": "status", "connected": True, "self_id": state.self_id})
-
-    worker_task = asyncio.create_task(worker())
-    startup_tasks = [asyncio.create_task(fetch_login_info()), asyncio.create_task(refresh_contacts_meta())]
+    startup = []
     try:
-        await broadcast_to_clients({"type": "status", "connected": True, "self_id": state.self_id})
+        state.napcat_ws, state.napcat_connected, state.qq_online = ws, True, False
+        state.self_id = None
+        async def login_info():
+            response = await send_qq_api_and_wait('get_login_info', {}, timeout=8)
+            if state.napcat_ws is ws and isinstance(response, dict) and isinstance(response.get('data'), dict):
+                state.self_id = response['data'].get('user_id')
+                await broadcast_to_clients(status_event())
+        online_observed = False
+        async def online_info():
+            response = await send_qq_api_and_wait('get_status', {}, timeout=8)
+            if (not online_observed and state.napcat_ws is ws and isinstance(response, dict)
+                    and response.get('status') == 'ok' and isinstance(response.get('data'), dict)
+                    and isinstance(response['data'].get('online'), bool)):
+                state.qq_online = response['data']['online']
+                await broadcast_to_clients(status_event())
+        startup = [spawn(login_info()), spawn(online_info()), spawn(refresh_contacts_meta())]
+        await broadcast_to_clients(status_event())
         async for msg in ws:
             if msg.type != WSMsgType.TEXT:
                 continue
@@ -1005,2211 +991,321 @@ async def napcat_ws_handler(request):
                 data = json.loads(msg.data)
                 if not isinstance(data, dict):
                     continue
-                echo = data.get("echo")
+                echo = data.get('echo')
                 pending = pending_requests.get(echo) if isinstance(echo, str) else None
                 if pending and pending[0] is ws:
-                    future = pending[1]
-                    if not future.done():
-                        future.set_result(data)
-                    continue
-                if echo is not None and not data.get("post_type"):
-                    continue
-                if (data.get("post_type") == "meta_event" and
-                        data.get("meta_event_type") == "heartbeat" and
-                        isinstance(data.get("status", {}), dict) and
-                        data.get("status", {}).get("online", True)):
+                    if not pending[1].done():
+                        pending[1].set_result(data)
                     continue
                 if state.napcat_ws is not ws:
                     break
-                try:
-                    event_size = len(msg.data.encode("utf-8"))
-                    if queue.bytes_used + event_size > NAPCAT_QUEUE_BYTES:
-                        raise asyncio.QueueFull
-                    queue.put_nowait((data, event_size))
-                    queue.bytes_used += event_size
-                except asyncio.QueueFull:
-                    logger.warning("NapCat event queue full; disconnecting to avoid unbounded memory")
-                    await ws.close(code=1013, message=b"event queue full")
-                    break
-            except json.JSONDecodeError:
+                if data.get('post_type') == 'meta_event':
+                    status = data.get('status')
+                    if isinstance(status, dict) and isinstance(status.get('online'), bool):
+                        online_observed = True
+                        online = status['online']
+                        if online != state.qq_online:
+                            state.qq_online = online
+                            await broadcast_to_clients(status_event())
+                    continue
+                if data.get('notice_type') == 'bot_offline':
+                    online_observed = True
+                    state.qq_online = False
+                    await broadcast_to_clients(status_event())
+                    continue
+                if data.get('post_type') not in ('message', 'notice'):
+                    continue
+                # Persist before any optional media/metadata processing or disconnect drain.
+                await store.call('enqueue_inbox', data, event_key=inbox_key(data))
+                inbox_available.set()
+            except StorageBusy:
+                # Do not silently acknowledge or drop an event we cannot persist.
+                await ws.close(code=1013, message=b'durable inbox capacity')
+                break
+            except (ValueError, TypeError, RecursionError):
                 continue
     finally:
-        fail_pending_for(ws)
-        for task in startup_tasks:
-            task.cancel()
+        # Lock release must be unconditional even if cleanup notification is cancelled.
         try:
-            # Keep the old connection as the owner until its queued events drain.
-            # Its socket is closed, so drained events cannot issue new API calls.
-            await asyncio.wait_for(queue.join(), DRAIN_TIMEOUT)
-        except asyncio.TimeoutError:
-            logger.warning("NapCat drain timed out with %d queued events", queue.qsize())
-        finally:
-            worker_task.cancel()
-            await asyncio.gather(worker_task, *startup_tasks, return_exceptions=True)
+            fail_pending_for(ws)
+            for task in startup:
+                task.cancel()
             if state.napcat_ws is ws:
-                state.napcat_ws = None
-                state.napcat_connected = False
+                state.napcat_ws, state.napcat_connected, state.qq_online = None, False, False
                 state.self_id = None
-                await broadcast_to_clients({"type": "status", "connected": False, "error": "NapCat已断开"})
+                await broadcast_to_clients(status_event())
+            await asyncio.gather(*startup, return_exceptions=True)
+        finally:
             napcat_transition_lock.release()
-
     return ws
 
-async def handle_recall(target_id, message_id):
-    def mutate(data):
-        for message in data["messages"].get(target_id, []):
-            if str(message.get("message_id")) == str(message_id) and not message.get("is_recalled"):
-                sender_name = message.get("sender_name")
-                message["content"] = f"「{sender_name}」撤回了一条消息"
-                message["is_recalled"] = True
-                message["media_url"] = None
-                message["quote"] = None
-                return [{"type": "message_recalled", "target_id": target_id, "message_id": message_id, "sender_name": sender_name}]
-        return []
-    await update_chat(mutate)
+async def handle_recall(target_id, message_id, platform_id=False):
+    async with state.lock:
+        result = await store.call('recall_message', message_id, target_id=target_id, platform_id=platform_id)
+        for message in result['messages']:
+            event = 'message_recalled' if message.get('is_recalled') else 'message_updated'
+            await broadcast_to_clients({'type': event, **message, 'revision': result['revision']})
+
+outbound_tasks = set()
+client_owners = {}
+
+
+def send_result(record):
+    parts = [{key: part[key] for key in ('index', 'status', 'message_id', 'platform_ids') if key in part}
+             for part in record.get('result', {}).get('parts', [])]
+    result = {'type': 'send_result', 'request_id': record['request_id'], 'target_id': record['target_id'],
+              'status': record['status'], 'content': record.get('result', {}).get('content', ''), 'parts': parts}
+    if len(parts) == 1:
+        result['message_id'] = parts[0].get('message_id')
+    return result
+
+
+async def publish_outbound_part(request_id, index):
+    # Store commits history and clears publication_pending in ONE transaction.
+    # A cancelled await may still commit; never overwrite that flag from local parts.
+    async with state.lock:
+        result = await store.call('publish_outbound_part', request_id, index)
+        if not result or not result.get('inserted'):
+            return result
+        message = result['message']
+        if result.get('contact'):
+            state.contacts[message['target_id']] = result['contact']
+            await broadcast_to_clients({'type': 'contact_add', 'contact': result['contact'], 'revision': result['revision']})
+        await broadcast_to_clients({'type': 'message', **message, 'revision': result['revision']})
+        return result
+
+
+async def finish_outbound(request_id, status, parts, wording):
+    record = await store.call('get_outbound', request_id)
+    # Existing durable publication flags win over possibly stale local flags after
+    # cancellation (AsyncStore settles accepted transactions before propagating it).
+    durable = {part['index']: part for part in record['result'].get('parts', [])}
+    merged = [durable.get(part['index'], part) for part in parts]
+    return await store.call('update_outbound', request_id, status, parts=merged, content=wording)
+
+
+async def outbound_send(ws, data, client_ip, owner=None):
+    target = data['target_id']
+    kind, peer = parse_target(target, data.get('msg_type'))
+    request_id = data['request_id']
+    # begin + is_new is transactional; never retry existing pending/unknown requests.
+    try:
+        record = await store.call('begin_outbound', request_id, target, data)
+    except StorageBusy:
+        await queue_client_message(ws, {'type': 'send_result', 'request_id': request_id, 'target_id': target,
+                                        'status': 'failed', 'content': '持久发送队列已满，未执行发送'})
+        return
+    except ValueError:
+        await queue_client_message(ws, {'type': 'toast', 'content': '请求ID已用于其他操作'})
+        return
+    await queue_client_message(ws, send_result(record))
+    if not record['is_new']:
+        return
+    parts = []
+    status, wording = 'failed', '发送失败'
+    try:
+        if not state.napcat_connected or not state.napcat_ws or state.napcat_ws.closed:
+            raise ValueError('NapCat 未连接')
+        action = 'send_private_msg' if kind == 'private' else 'send_group_msg'
+        params = {'user_id' if kind == 'private' else 'group_id': int(peer), 'auto_escape': False}
+        payload = []
+        quote = data.get('quote')
+        quote_id = None
+        if quote:
+            quote_id = quote.get('id')
+            if not isinstance(quote_id, str):
+                raise ValueError('无效引用')
+            original = await store.call('get_message', target, quote_id)
+            if not original or original.get('is_recalled'):
+                raise ValueError('引用消息不可用')
+            ids = await store.call('platform_ids', target, quote_id)
+            live = next((x['platform_id'] for x in ids if not x['recalled']), None)
+            if not live:
+                raise ValueError('引用消息没有平台ID')
+            payload.append({'type': 'reply', 'data': {'id': live}})
+        local_path = data.get('file_local_path')
+        file_segment = None
+        operations = []
+        if local_path:
+            local_path = safe_upload_path(local_path)
+            if not local_path:
+                raise ValueError('文件路径无效')
+            binding = upload_bindings.get(local_path)
+            upload_id = data.get('file_upload_id') or data.get('upload_request_id')
+            if (not binding or binding['owner'] is not owner or binding['target_id'] != target
+                    or binding['upload_id'] != upload_id or binding['expires'] <= time.time()
+                    or binding['request_id'] not in (None, request_id)):
+                raise ValueError('附件不属于当前会话或请求，请重新上传')
+            binding['request_id'] = request_id
+            local_url = '/files/' + os.path.basename(local_path)
+            if data.get('file_is_image'):
+                image = await asyncio.to_thread(encode_upload_image, local_path)
+                payload.append({'type': 'image', 'data': {'file': 'base64://' + image}})
+                file_segment = {'type': 'image', 'url': local_url}
+            else:
+                name = os.path.basename(data.get('file_orig_name', 'file').replace('\\', '/'))[:255]
+                with open_upload(local_path) as file:
+                    size = os.fstat(file.fileno()).st_size
+                if size > MAX_TRANSFER:
+                    raise ValueError('文件过大')
+                file_segment = {'type': 'file', 'url': local_url, 'name': name, 'size': size}
+                if not PUBLIC_BASE_URL:
+                    raise ValueError('未配置附件公网地址')
+                operations.append(([{'type': 'file', 'data': {'file': PUBLIC_BASE_URL + local_url, 'name': name}}],
+                                   {'content': '[文件] ' + name, 'file_name': name, 'file_size': size,
+                                    'file_url': local_url, 'segments': [file_segment]}, 600.0))
+        content = data.get('content', '')
+        if content:
+            text = content
+            if DISCLOSE_CLIENT_IP:
+                text += '\nIP:' + str(client_ip)
+            payload.append({'type': 'text', 'data': {'text': text}})
+        if payload and any(x['type'] != 'reply' for x in payload):
+            segments = ([file_segment] if file_segment and file_segment['type'] == 'image' else [])
+            if content:
+                segments.append({'type': 'text', 'text': content})
+            operations.append((payload, {'content': content or '[图片]', 'segments': segments,
+                                        'media_url': file_segment['url'] if file_segment and file_segment['type'] == 'image' else None}, 120.0))
+        if not operations:
+            raise ValueError('空消息')
+        for index, (segments, display, deadline) in enumerate(operations):
+            if not sessions.is_active(owner):
+                status = 'partial' if parts else 'failed'
+                wording = '会话已结束，未继续发送'
+                break
+            response = await send_qq_api_and_wait(action, {**params, 'message': segments}, timeout=deadline)
+            if response is None:
+                status = 'partial' if parts else 'unknown'
+                wording = '部分已发送；其余结果未知，勿盲目重试' if parts else '发送结果未知，请先确认，勿盲目重试'
+                break
+            if not isinstance(response, dict) or response.get('status') != 'ok' or response.get('retcode') != 0:
+                status = 'partial' if parts else 'failed'
+                wording = '部分已发送，后续发送失败' if parts else '发送失败'
+                break
+            result_data = response.get('data')
+            platform = result_data.get('message_id') if isinstance(result_data, dict) else None
+            # A successful side effect without an ID is still recorded, but cannot be recalled.
+            mid = 'out_' + hashlib.sha256((request_id + ':' + str(index)).encode()).hexdigest()[:32]
+            message = {**display, 'message_id': mid, 'target_id': target,
+                       'sender_name': str(state.self_id or '我'), 'sender_id': str(state.self_id or ''),
+                       'direction': 'outgoing', 'request_id': request_id,
+                       'napcat_message_ids': [str(platform)] if platform is not None else [],
+                       'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+            parts.append({'index': index, 'status': 'confirmed', 'message_id': mid,
+                          'platform_ids': message['napcat_message_ids'], 'message': message,
+                          'quote_id': quote_id, 'publication_pending': True})
+            # Persist the external result before local publication; only the atomic
+            # publication transaction may clear its recovery marker.
+            await store.call('update_outbound', request_id, 'pending', parts=parts)
+            await publish_outbound_part(request_id, index)
+            parts[-1]['publication_pending'] = False
+        else:
+            status, wording = 'confirmed', '已发送'
+    except asyncio.CancelledError:
+        await finish_outbound(request_id, 'partial' if parts else 'unknown', parts,
+                              '操作中断，结果可能未知，勿盲目重试')
+        raise
+    except ValueError as exc:
+        status = 'partial' if parts else 'failed'
+        wording = str(exc)
+    except Exception:
+        status = 'partial' if parts else 'unknown'
+        wording = '发送结果需核实，勿盲目重试'
+        logger.error('outbound operation could not be completed')
+    record = await finish_outbound(request_id, status, parts, wording)
+    await queue_client_message(ws, send_result(record))
+
+
+async def handle_client_payload(ws, data, owner, client_ip):
+    if not sessions.is_active(owner, touch=True):
+        await ws.close(code=1008, message=b'session expired')
+        return
+    try:
+        data = validate_client_message(data)
+        kind = data['type']
+        if kind == 'ping':
+            await queue_client_message(ws, {'type': 'pong'})
+        elif kind == 'get_history':
+            await send_history(ws, data['target_id'])
+        elif kind == 'get_send_result':
+            record = await store.call('get_outbound', data['request_id'])
+            if record:
+                if data.get('target_id') not in (None, record['target_id']):
+                    raise ValueError('request target mismatch')
+                await queue_client_message(ws, send_result(record))
+        elif kind == 'send_message':
+            # Independent of the receive loop: logout, ping and shutdown remain responsive.
+            # The transactional request ID gate prevents concurrent duplicate sends.
+            if len(outbound_tasks) >= 64:
+                raise ValueError('发送任务已满')
+            task = spawn(outbound_send(ws, data, client_ip, owner))
+            outbound_tasks.add(task)
+            task.add_done_callback(outbound_tasks.discard)
+        elif kind == 'recall_message':
+            target, mid = data['target_id'], data['message_id']
+            message = await store.call('get_message', target, mid)
+            if not message or message.get('direction') != 'outgoing':
+                raise ValueError('只能撤回自己发送的消息')
+            ids = await store.call('platform_ids', target, mid)
+            if not ids:
+                raise ValueError('消息没有可撤回的平台ID')
+            for item in ids:
+                if item['recalled']:
+                    continue
+                response = await send_qq_api_and_wait('delete_msg', {'message_id': item['platform_id']})
+                if not isinstance(response, dict) or response.get('status') != 'ok' or response.get('retcode') != 0:
+                    raise ValueError('撤回结果未知，请先确认' if response is None else '撤回失败')
+                await handle_recall(target, item['platform_id'], platform_id=True)
+    except StorageBusy:
+        await queue_client_message(ws, {'type': 'toast', 'content': '持久存储繁忙，请稍后查询操作状态'})
+    except (ValueError, TypeError, KeyError, RecursionError):
+        await queue_client_message(ws, {'type': 'toast', 'content': '请求无效或操作未完成，请检查目标与消息状态'})
+
+
+async def initialize_client(ws, owner):
+    queue = asyncio.Queue(maxsize=BROADCAST_QUEUE_LIMIT)
+    queue.bytes_used = 0
+    client_senders[ws] = (queue, spawn(client_sender(ws, queue)))
+    client_owners[ws] = owner
+    # Serialize snapshot boundary against all publish paths; initial contacts use backpressure.
+    async with state.lock:
+        await queue_client_message(ws, status_event(), backpressure=True)
+        for contact in await store.call('list_contacts'):
+            if not await queue_client_message(ws, {'type': 'contact_add', 'contact': contact}, backpressure=True):
+                return
+        state.clients.add(ws)
+
 
 async def client_ws_handler(request):
-    token = request.query.get("token")
-    if token not in active_tokens:
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-        await ws.close(code=1008, message=b"Unauthorized")
-        return ws
-
-    ws = web.WebSocketResponse()
+    owner = sessions.require(request, websocket=True)
+    ws = web.WebSocketResponse(max_msg_size=CLIENT_FRAME_BYTES, heartbeat=30)
     await ws.prepare(request)
-    state.clients.add(ws)
-    send_queue = asyncio.Queue(maxsize=BROADCAST_QUEUE_LIMIT)
-    send_queue.bytes_used = 0
-    client_senders[ws] = (send_queue, asyncio.create_task(client_sender(ws, send_queue)))
-
-    client_ip = request.headers.get("X-Real-IP") or \
-                request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or \
-                request.remote
-
+    resource = 'ws:' + secrets.token_hex(16)
+    if not sessions.bind(owner, resource, lambda: ws.close(code=1008, message=b'session revoked')):
+        await ws.close(code=1013, message=b'session capacity')
+        return ws
     try:
-        await queue_client_message(ws, {"type": "status", "connected": state.napcat_connected, "self_id": state.self_id})
-        for contact in list(state.contacts.values()):
-            await queue_client_message(ws, {"type": "contact_add", "contact": contact})
+        await initialize_client(ws, owner)
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
-                data = json.loads(msg.data)
-
-                if data.get("type") == "get_history":
-                    target_id = data.get("target_id")
-                    if not isinstance(target_id, str) or len(target_id) > 256:
-                        continue
-                    await send_history(ws, target_id)
-
-                elif data.get("type") == "send_message":
-                    target_id, content, msg_type = data.get("target_id"), data.get("content"), data.get("msg_type")
-                    quote_info = data.get("quote")
-                    file_local_path = data.get("file_local_path")
-                    if file_local_path:
-                        file_local_path = safe_upload_path(file_local_path)
-                        if not file_local_path:
-                            await queue_client_message(ws, {"type": "toast", "content": "文件路径无效"})
-                            continue
-                    file_orig_name = data.get("file_orig_name", "file")
-                    file_is_image = data.get("file_is_image", False)
-
-                    if not state.napcat_connected:
-                        await queue_client_message(ws, {"type": "toast", "content": "NapCat 未连接，请检查配置"})
-                        continue
-
-                    if state.napcat_ws and not state.napcat_ws.closed:
-                        action = "send_private_msg" if msg_type == "private" else "send_group_msg"
-                        time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                        message_payload = []
-                        reply_target_id = None
-                        if quote_info:
-                            reply_target_id = quote_info.get("napcat_id")
-                            if not reply_target_id and quote_info.get("id") and not str(quote_info.get("id")).startswith("local_"):
-                                reply_target_id = quote_info.get("id")
-                        if reply_target_id:
-                            message_payload.append({"type": "reply", "data": {"id": str(reply_target_id)}})
-
-                        local_url = None
-                        send_file_name = None
-                        send_file_size = 0
-                        send_file_url = None
-                        file_public_url = None
-                        if file_local_path and os.path.exists(file_local_path):
-                            if file_is_image:
-                                try:
-                                    img_b64 = await asyncio.to_thread(encode_upload_image, file_local_path)
-                                    message_payload.append({"type": "image", "data": {"file": f"base64://{img_b64}"}})
-                                    local_url = f"/files/{os.path.basename(file_local_path)}"
-                                except Exception as e:
-                                    await queue_client_message(ws, {"type": "toast", "content": "图片读取失败"})
-                                    continue
-                            else:
-                                send_file_name = os.path.basename(file_orig_name or "文件")
-                                try:
-                                    with open_upload(file_local_path) as f:
-                                        send_file_size = os.fstat(f.fileno()).st_size
-                                except OSError:
-                                    send_file_size = 0
-                                send_file_url = f"/files/{os.path.basename(file_local_path)}"
-                                file_public_url = PUBLIC_BASE_URL + send_file_url
-
-                        if content:
-                            formatted_text = f"正文:{content}\nIP:{client_ip}\n{time_str}"
-                            message_payload.append({"type": "text", "data": {"text": formatted_text}})
-
-                        file_sent = False
-                        file_message_id = None
-                        if file_public_url:
-                            file_params = {
-                                "message": [{"type": "file", "data": {"file": file_public_url, "name": send_file_name}}],
-                                "auto_escape": False
-                            }
-                            if msg_type == "private": file_params["user_id"] = int(target_id)
-                            else: file_params["group_id"] = int(target_id)
-                            file_resp = await send_qq_api_and_wait(action, file_params, timeout=600.0)
-                            file_sent = bool(file_resp and file_resp.get("status") == "ok" and file_resp.get("retcode") == 0)
-                            if file_sent:
-                                file_message_id = (file_resp.get("data") or {}).get("message_id")
-                            elif file_resp is None:
-                                await queue_client_message(ws, {"type": "toast", "content": "文件发送结果未知，请先确认对方是否收到，勿重复发送"})
-                                continue
-                            else:
-                                await queue_client_message(ws, {"type": "toast", "content": "文件直发失败，已改为链接发送"})
-
-                        sent_resp = None
-                        if message_payload or (file_public_url and not file_sent):
-                            final_payload = list(message_payload)
-                            if file_public_url and not file_sent:
-                                final_payload.append({"type": "text", "data": {"text": f"对方向你发送了一个文件 {send_file_name}\n{file_public_url}\n{time_str}\nIP:{client_ip}"}})
-                            params = {"message": final_payload, "auto_escape": False}
-                            if msg_type == "private": params["user_id"] = int(target_id)
-                            else: params["group_id"] = int(target_id)
-                            sent_resp = await send_qq_api_and_wait(action, params)
-                            if sent_resp is None:
-                                await queue_client_message(ws, {"type": "toast", "content": "消息发送结果未知，请先确认对方是否收到，勿重复发送"})
-                                continue
-                            if not isinstance(sent_resp, dict) or sent_resp.get("status") != "ok" or sent_resp.get("retcode") != 0:
-                                await queue_client_message(ws, {"type": "toast", "content": "消息发送失败；文件可能已单独发送，请先核实" if file_sent else "消息发送失败"})
-                                continue
-                        elif not file_sent:
-                            continue
-
-                        text_message_id = None
-                        if isinstance(sent_resp, dict) and isinstance(sent_resp.get("data"), dict):
-                            text_message_id = sent_resp["data"].get("message_id")
-                        napcat_message_ids = [x for x in (file_message_id, text_message_id) if x]
-
-                        # Retain sent files for normal cleanup; unlinking by name here could race a replacement.
-
-                        display_content = content if content else (f"[文件] {send_file_name}" if send_file_name else "[图片]")
-
-                        msg_obj = {
-                            "message_id": f"local_{datetime.now().timestamp()}", "target_id": target_id, "sender_name": (str(state.self_id) if state.self_id else "我"),
-                            "content": display_content, "media_url": local_url, "quote": quote_info,
-                            "file_name": send_file_name, "file_size": send_file_size, "file_url": send_file_url,
-                            "napcat_message_id": napcat_message_ids[0] if napcat_message_ids else None,
-                            "napcat_message_ids": napcat_message_ids,
-                            "time": time_str
-                        }
-                        await save_message(target_id, msg_obj)
-
-                elif data.get("type") == "recall_message":
-                    target_id, message_id = data.get("target_id"), data.get("message_id")
-                    if not state.napcat_connected:
-                        await queue_client_message(ws, {"type": "toast", "content": "NapCat 未连接"})
-                        continue
-
-                    target_msg = next((m for m in state.messages.get(target_id, []) if str(m.get("message_id")) == str(message_id)), None)
-                    is_mine = bool(target_msg) and (target_msg.get("sender_name") == "我" or (state.self_id and str(target_msg.get("sender_name")) == str(state.self_id)))
-                    if target_msg and is_mine:
-                        real_ids = target_msg.get("napcat_message_ids") or []
-                        if not real_ids and target_msg.get("napcat_message_id"):
-                            real_ids = [target_msg.get("napcat_message_id")]
-                        if not real_ids:
-                            await queue_client_message(ws, {"type": "toast", "content": "该消息不支持撤回"})
-                            continue
-                        failed = False
-                        for real_id in real_ids:
-                            resp = await send_qq_api_and_wait("delete_msg", {"message_id": real_id})
-                            if not isinstance(resp, dict) or resp.get("status") != "ok" or resp.get("retcode") != 0:
-                                failed = True
-                                wording = "撤回结果未知，请先确认消息状态；部分消息可能已撤回" if resp is None else "撤回失败，部分消息可能已撤回"
-                                await queue_client_message(ws, {"type": "toast", "content": wording})
-                                break
-                        if not failed:
-                            await handle_recall(target_id, message_id)
-                    else:
-                        await queue_client_message(ws, {"type": "toast", "content": "你只能撤回自己发送的消息"})
+                try:
+                    data = json.loads(msg.data)
+                except (ValueError, RecursionError):
+                    await queue_client_message(ws, {'type': 'toast', 'content': '无效JSON请求'})
+                    continue
+                await handle_client_payload(ws, data, owner, sessions.client_ip(request))
     finally:
         state.clients.discard(ws)
+        client_owners.pop(ws, None)
         remove_client_sender(ws)
+        sessions.unbind(owner, resource)
     return ws
 
 async def web_handler(request):
-    html = """
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-        <title>QQ Web Chat</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-        <style>
-            ::-webkit-scrollbar { width: 6px; height: 6px; }
-            ::-webkit-scrollbar-track { background: transparent; }
-            ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
-            .context-menu { display: none; position: fixed; background: white; border: 1px solid #e5e7eb; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); z-index: 1000; min-width: 90px; white-space: nowrap; overflow: hidden;}
-            .context-menu.show { display: block; }
-            .ctx-item { padding: 10px 20px; font-size: 14px; cursor: pointer; color: #374151; transition: background 0.2s; text-align: center;}
-            .ctx-item:hover { background: #f3f4f6; }
-            .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.8); color: white; padding: 10px 20px; border-radius: 8px; font-size: 14px; z-index: 9999; transition: opacity 0.3s; }
-
-            #drop-overlay { position: fixed; inset: 0; background: rgba(59,130,246,0.2); border: 4px dashed #3b82f6; z-index: 9998; display: none; align-items: center; justify-content: center; pointer-events: none; }
-            #drop-overlay.show { display: flex; }
-            /* 登录标题手写笔画动画 + 写完后发光变粗 */
-            #login-title-svg { transition: filter 0.7s ease; opacity: 0; }
-            #login-title-svg path { fill: none; stroke: #1f2937; stroke-width: 0.7; stroke-linecap: round; stroke-linejoin: round; transition: stroke-width 0.8s ease; }
-            /* 写完变粗：直接上粉光，无蓝光阶段 */
-            #login-title-svg.title-pink path,
-            #login-title-svg.title-bold path { stroke-width: 1.35; }
-            #login-title-svg.title-pink { filter: drop-shadow(0 0 5px rgba(244,114,182,0.40)) drop-shadow(0 0 12px rgba(244,114,182,0.16)); }
-            /* 加粗完成后：光完全消失 */
-            #login-title-svg.title-bold { filter: none; }
-            /* 标题写完后，登录框从下方渐变浮出 */
-            #login-card { pointer-events: none; opacity: 0; transform: translateY(34px); animation: cardIn 0.9s cubic-bezier(0.22, 0.61, 0.36, 1) 3s forwards; background-color: rgba(255,255,255,.55); -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px); border-color: rgba(255,255,255,.65); }
-            @keyframes cardIn { to { opacity: 1; transform: translateY(0); } }
-
-            /* 登录页背景柔光 */
-            #login-bg { position: absolute; inset: 0; overflow: hidden; pointer-events: none; z-index: 0; }
-            #login-bg .blob { position: absolute; border-radius: 9999px; filter: blur(70px); opacity: .28; animation: blobFloat 16s ease-in-out infinite alternate; }
-            #login-bg-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: opacity 1.8s ease; }
-            #login-bg-mask { position: absolute; inset: 0; background: linear-gradient(180deg, rgba(243,244,246,.12), rgba(243,244,246,.26)); }
-            #bg-error { position: absolute; top: 14px; left: 16px; z-index: 20; font-size: 12px; color: #ef4444; opacity: 0; transition: opacity .3s ease; pointer-events: none; }
-            #bg-error.show { opacity: 1; }
-            #login-footer { position: absolute; bottom: 14px; left: 0; right: 0; text-align: center; font-size: 11px; letter-spacing: .02em; color: rgba(31,41,55,.35); pointer-events: none; z-index: 20; }
-            #login-canvas { position: absolute; inset: 0; display: block; }
-            #login-bg .blob-a { width: 380px; height: 380px; background: rgba(59,130,246,.20); top: -70px; left: -60px; }
-            #login-bg .blob-b { width: 420px; height: 420px; background: rgba(244,114,182,.15); bottom: -110px; right: -70px; animation-delay: -8s; }
-            @keyframes blobFloat { from { transform: translate3d(0,0,0) scale(1); } to { transform: translate3d(50px,36px,0) scale(1.18); } }
-
-            /* 登录框内容依次浮现 */
-            #login-card > * { opacity: 0; transform: translateY(8px); animation: cardItemIn .55s ease forwards; }
-            #login-card > h2 { animation-delay: 3.2s; }
-            #login-card > input { animation-delay: 3.34s; }
-            #login-card > button { animation-delay: 3.46s; }
-            #login-card > #login-error { animation-delay: 3.5s; }
-            @keyframes cardItemIn { to { opacity: 1; transform: translateY(0); } }
-
-            /* 按钮质感 */
-            #login-btn { background-color: rgba(244,114,182,.78); box-shadow: 0 6px 18px -6px rgba(244,114,182,.50); transition: transform .15s ease, box-shadow .25s ease, background-color .25s ease; }
-            #login-btn:hover { background-color: rgba(244,114,182,.92); box-shadow: 0 10px 24px -8px rgba(244,114,182,.60); }
-            #login-btn:active { transform: scale(.985); }
-            /* 深色主题 */
-            body.theme-dark { background:#0f1115 !important; color:#e5e7eb !important; }
-            body.theme-dark .bg-white { background-color:#171a21 !important; }
-            body.theme-dark .bg-gray-50 { background-color:#1b1f27 !important; }
-            body.theme-dark .bg-gray-100 { background-color:#0f1115 !important; }
-            body.theme-dark .bg-gray-200 { background-color:#252a33 !important; }
-            body.theme-dark .text-gray-800 { color:#e5e7eb !important; }
-            body.theme-dark .text-gray-700 { color:#dfe3e8 !important; }
-            body.theme-dark .text-gray-600 { color:#b6bcc6 !important; }
-            body.theme-dark .text-gray-500 { color:#9aa1ac !important; }
-            body.theme-dark .text-gray-400 { color:#8a919c !important; }
-            body.theme-dark .border-gray-200 { border-color:#2a2f3a !important; }
-            body.theme-dark .border-gray-300 { border-color:#363c48 !important; }
-            body.theme-dark .hover\\:bg-gray-100:hover { background-color:#20242c !important; }
-            body.theme-dark input, body.theme-dark textarea { background-color:#11151b !important; color:#e5e7eb !important; border-color:#2a2f3a !important; }
-            body.theme-dark .settings-panel { background-color:#171a21 !important; border-color:#2a2f3a !important; }
-            body.chat-bg-on { background-size: cover !important; background-position: center !important; background-attachment: fixed !important; }
-            body.chat-bg-on #sidebar .bg-white, body.chat-bg-on #chat-area .bg-white { background-color: rgba(255,255,255,.28) !important; -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
-            body.chat-bg-on #sidebar .bg-gray-50, body.chat-bg-on #chat-area .bg-gray-50 { background-color: rgba(255,255,255,.08) !important; }
-            body.chat-bg-on #sidebar .bg-gray-100, body.chat-bg-on #chat-area .bg-gray-100 { background-color: transparent !important; }
-            body.chat-bg-on #sidebar { background-color: rgba(255,255,255,.10) !important; -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); }
-            body.chat-bg-on #sidebar .bg-gray-50 { background-color: transparent !important; }
-            body.chat-bg-on #chat-area { background-color: transparent !important; }
-            body.chat-bg-on #messages { background: transparent !important; }
-            body.theme-dark.chat-bg-on #sidebar .bg-white, body.theme-dark.chat-bg-on #chat-area .bg-white { background-color: rgba(17,21,27,.42) !important; }
-            body.theme-dark.chat-bg-on #sidebar .bg-gray-50, body.theme-dark.chat-bg-on #chat-area .bg-gray-50 { background-color: rgba(17,21,27,.18) !important; }
-            body.theme-dark.chat-bg-on #sidebar .bg-gray-100, body.theme-dark.chat-bg-on #chat-area .bg-gray-100 { background-color: transparent !important; }
-            body.theme-dark.chat-bg-on #sidebar { background-color: rgba(17,21,27,.28) !important; }
-            body.chat-bg-on { background-image: var(--chat-wallpaper) !important; }
-            #save-wallpaper-btn { position: fixed; top: 12px; right: 12px; z-index: 30; height: 32px; padding: 0 12px; border: 1px solid rgba(156,163,175,.55); border-radius: 8px; background: rgba(255,255,255,.80); color: #374151; font-size: 12px; cursor: pointer; }
-            #save-wallpaper-btn[hidden] { display: none !important; }
-            #save-wallpaper-btn:disabled { opacity: .55; cursor: default; }
-            body.theme-dark #save-wallpaper-btn { background: rgba(23,26,33,.85); color: #e5e7eb; }
-            body.wallpaper-save-visible #chat-area > div:first-child { padding-right: 112px; }
-            @media (max-width: 767px) { body.wallpaper-save-visible #sidebar > div:first-child { padding-right: 112px; } }
-        </style>
-    </head>
-    <body class="bg-gray-100 h-screen w-screen overflow-hidden flex font-sans text-gray-800">
-
-        <div id="drop-overlay">
-            <div class="bg-white p-6 rounded-xl shadow-2xl text-blue-500 font-bold text-xl flex items-center gap-3">
-                <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
-                松开鼠标上传文件
-            </div>
-        </div>
-
-        <div id="login-overlay" class="fixed inset-0 bg-gray-100 z-[9999] flex items-center justify-center px-4">
-            <div id="login-bg" aria-hidden="true">
-                <img id="login-bg-img" alt="">
-                <div id="login-bg-mask"></div>
-                <canvas id="login-canvas"></canvas>
-                <span class="blob blob-a"></span><span class="blob blob-b"></span>
-            </div>
-            <div id="bg-error">壁纸加载失败</div>
-            <div id="login-footer">@LJY2231 · 保留所有权</div>
-            <h1 id="login-title" class="absolute z-10 top-24 md:top-32 left-1/2 -translate-x-1/2 w-[88vw] max-w-[560px] flex justify-center">
-    <svg id="login-title-svg" viewBox="0 0 205 26" class="w-auto h-[52px] md:h-[58px]" role="img" aria-label="QQ Web Chat">
-          <g>
-            <path d="M9,1 L7,2 5,4 4,6 3,9 3,14 4,17 5,19 7,21 9,22 13,22 15,21 17,19 18,17 19,14 19,9 18,6 17,4 15,2 13,1 9,1" transform="translate(4,2)"/>
-            <path d="M12,18 L18,24" transform="translate(4,2)"/>
-            <path d="M9,1 L7,2 5,4 4,6 3,9 3,14 4,17 5,19 7,21 9,22 13,22 15,21 17,19 18,17 19,14 19,9 18,6 17,4 15,2 13,1 9,1" transform="translate(26,2)"/>
-            <path d="M12,18 L18,24" transform="translate(26,2)"/>
-            <path d="M2,1 L7,22" transform="translate(60,2)"/>
-            <path d="M12,1 L7,22" transform="translate(60,2)"/>
-            <path d="M12,1 L17,22" transform="translate(60,2)"/>
-            <path d="M22,1 L17,22" transform="translate(60,2)"/>
-            <path d="M3,14 L15,14 15,12 14,10 13,9 11,8 8,8 6,9 4,11 3,14 3,16 4,19 6,21 8,22 11,22 13,21 15,19" transform="translate(85,2)"/>
-            <path d="M4,1 L4,22" transform="translate(103,2)"/>
-            <path d="M4,11 L6,9 8,8 11,8 13,9 15,11 16,14 16,16 15,19 13,21 11,22 8,22 6,21 4,19" transform="translate(103,2)"/>
-            <path d="M18,6 L17,4 15,2 13,1 9,1 7,2 5,4 4,6 3,9 3,14 4,17 5,19 7,21 9,22 13,22 15,21 17,19 18,17" transform="translate(134,2)"/>
-            <path d="M4,1 L4,22" transform="translate(155,2)"/>
-            <path d="M4,12 L7,9 9,8 12,8 14,9 15,12 15,22" transform="translate(155,2)"/>
-            <path d="M15,8 L15,22" transform="translate(173,2)"/>
-            <path d="M15,11 L13,9 11,8 8,8 6,9 4,11 3,14 3,16 4,19 6,21 8,22 11,22 13,21 15,19" transform="translate(173,2)"/>
-            <path d="M5,1 L5,18 6,21 8,22 10,22" transform="translate(191,2)"/>
-            <path d="M2,8 L9,8" transform="translate(191,2)"/>
-          </g>
-        </svg>
-            </h1>
-            <div id="login-card" class="relative z-10 bg-white p-10 rounded-2xl shadow-xl w-full max-w-md border border-gray-200">
-                <h2 class="text-2xl font-bold text-center text-gray-800 mb-6">用户登录</h2>
-                <input type="password" id="login-pwd" class="w-full border border-gray-300 rounded-lg px-4 py-3 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200 transition-all mb-4" placeholder="请输入密码">
-                <button id="login-btn" class="w-full bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 rounded-lg transition-colors">登录</button>
-                <p id="login-error" class="text-red-500 text-sm mt-3 text-center hidden">密码错误，请重试</p>
-            </div>
-        </div>
-
-        <div id="context-menu" class="context-menu">
-            <div id="ctx-reply" class="ctx-item">引用</div>
-            <div id="ctx-recall" class="ctx-item text-red-500 border-t border-gray-100">撤回</div>
-        </div>
-
-        <button id="save-wallpaper-btn" type="button" hidden disabled title="下载当前显示的壁纸">保存壁纸</button>
-
-        <!-- 左侧联系人列表 -->
-        <div id="sidebar" class="w-full md:w-72 bg-white border-r border-gray-200 flex flex-col shrink-0 h-full absolute md:relative z-20">
-            <div class="h-14 border-b border-gray-200 flex items-center px-4 bg-gray-50 shrink-0">
-                <div id="status-dot" class="w-3 h-3 rounded-full bg-red-500 mr-2 shadow-sm shrink-0"></div>
-                <span id="status-text" class="text-sm font-semibold text-gray-600 truncate">等待连接...</span>
-            </div>
-            <div id="contact-list" class="flex-1 overflow-y-auto p-2 space-y-1">
-                <div class="text-center text-gray-400 text-sm mt-10" id="empty-contact">暂无会话</div>
-            </div>
-            <div class="border-t border-gray-200 bg-gray-50 px-3 py-2 shrink-0 flex items-center justify-between">
-                <button id="logout-btn" type="button" class="px-3 py-1.5 text-xs rounded-md border border-gray-300 text-gray-600 bg-white hover:text-red-500 hover:border-red-300 transition-colors">退出登录</button>
-                <button id="refresh-bg-btn" type="button" class="text-xs text-gray-400 hover:text-gray-600 transition-colors">随机壁纸</button>
-                <button id="settings-btn" type="button" class="text-xs text-gray-400 hover:text-gray-600 transition-colors">设置</button>
-            </div>
-        </div>
-
-        <!-- 右侧聊天区域 -->
-        <div id="chat-area" class="hidden md:flex flex-1 flex-col h-full bg-gray-50 relative overflow-hidden w-full">
-            <div class="h-14 border-b border-gray-200 flex items-center px-4 md:px-6 bg-white shrink-0 shadow-sm z-10">
-                <button id="back-btn" class="md:hidden mr-3 text-gray-500 hover:text-gray-700 focus:outline-none">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path></svg>
-                </button>
-                <span class="text-lg font-bold text-gray-700 truncate" id="current-chat-name">请选择联系人</span>
-            </div>
-
-            <div id="message-area" class="flex-1 h-0 overflow-y-auto p-4 md:p-6 space-y-4" onscroll="hideContextMenu()"></div>
-
-            <div id="quote-preview" class="hidden w-full bg-gray-100 border-t border-gray-200 px-4 py-2 flex justify-between items-center shrink-0">
-                <div class="text-xs text-gray-500 truncate" id="quote-text">正在引用...</div>
-                <button id="cancel-quote" class="text-gray-400 hover:text-gray-600 text-lg ml-2">&times;</button>
-            </div>
-
-            <!-- 附件预览区 -->
-            <div id="file-preview-area" class="hidden w-full bg-gray-100 border-t border-gray-200 px-4 py-2 flex items-center shrink-0">
-                <div class="relative inline-flex items-center bg-white p-2 rounded-lg border border-gray-300 shadow-sm max-w-full pb-3">
-                    <img id="preview-img" class="h-12 w-12 rounded object-contain mr-2 hidden">
-                    <div id="preview-file-icon" class="w-10 h-10 flex items-center justify-center text-blue-500 mr-2 hidden">
-                        <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"></path></svg>
-                    </div>
-                    <div class="flex flex-col overflow-hidden max-w-[200px] mr-4">
-                        <span id="preview-filename" class="text-sm truncate font-medium text-gray-700">filename.ext</span>
-                        <span id="preview-filesize" class="text-xs text-gray-400">0 KB</span>
-                    </div>
-                    <span id="preview-percent" class="text-xs text-blue-500 font-bold absolute right-2 bottom-3 hidden">0%</span>
-                    <button id="cancel-file" class="absolute -top-2 -right-2 bg-red-500 text-white rounded-full w-5 h-5 flex items-center justify-center text-xs shadow-md hover:bg-red-600">&times;</button>
-                    <!-- 加粗进度条 -->
-                    <div class="absolute bottom-0 left-0 w-full h-1.5 bg-gray-200 rounded-b-lg overflow-hidden">
-                        <div id="upload-progress-bar" class="h-full bg-blue-500 transition-all duration-300" style="width: 0%;"></div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- 底部工具栏 + 输入框 -->
-            <div class="w-full bg-white border-t border-gray-200 px-2 md:px-4 py-2 shrink-0 z-10 flex flex-col gap-1">
-
-                <!-- 工具栏 -->
-                <div class="flex items-center space-x-4 px-2 text-gray-500 select-none">
-                    <button id="btn-image" class="hover:text-gray-800 transition-colors flex items-center" title="上传图片">
-                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
-                    </button>
-                    <button id="btn-file" class="hover:text-gray-800 transition-colors flex items-center" title="上传文件">
-                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path></svg>
-                    </button>
-                    <input type="file" id="image-input" class="hidden" accept="image/*">
-                    <input type="file" id="file-input" class="hidden">
-                </div>
-
-                <!-- 输入与发送 -->
-                <div class="flex items-end bg-gray-50 border border-gray-200 rounded-xl p-1.5">
-                    <textarea id="input-box" rows="1" class="flex-1 w-0 bg-transparent outline-none resize-none px-3 py-2 text-sm max-h-32 min-h-[38px]" placeholder="输入消息..." disabled></textarea>
-                    <button id="send-btn" class="shrink-0 w-16 h-10 ml-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg text-sm font-semibold disabled:opacity-50 whitespace-nowrap" disabled>发送</button>
-                </div>
-            </div>
-        </div>
-
-        <script>
-            let ws = null;
-            let currentTargetId = null;
-            let currentMsgType = null;
-            let quoteMsg = null;
-            let isNapcatOnline = false;
-            let myQQ = null;
-            const contacts = {};
-            let contextMenuMsg = null;
-
-            let authToken = localStorage.getItem('webchat_token');
-
-            let pendingFile = null;
-            let currentXHR = null;
-            var unreadCounts = {};
-            (function loadUnread() {
-                try {
-                    var raw = localStorage.getItem('webchat_unread');
-                    if (raw) {
-                        var d = JSON.parse(raw);
-                        if (d && typeof d === 'object') { unreadCounts = d; }
-                    }
-                } catch (e) {}
-            })();
-            function saveUnread() {
-                try { localStorage.setItem('webchat_unread', JSON.stringify(unreadCounts)); } catch (e) {}
-            }
-
-
-            let wsStatus = 'connecting';
-            let reconnectTimeout = null;
-            let countdownInterval = null;
-
-            const loginOverlay = document.getElementById('login-overlay');
-            const loginPwd = document.getElementById('login-pwd');
-            const loginBtn = document.getElementById('login-btn');
-            const loginError = document.getElementById('login-error');
-            const logoutBtn = document.getElementById('logout-btn');
-            const settingsBtn = document.getElementById('settings-btn');
-            const refreshBgBtn = document.getElementById('refresh-bg-btn');
-            const saveWallpaperBtn = document.getElementById('save-wallpaper-btn');
-            (function enableCardAfterIntro() {
-                const c = document.getElementById('login-card');
-                if (!c) return;
-                c.addEventListener('animationend', function() { c.style.pointerEvents = 'auto'; });
-            })();
-
-            // 手写笔画动画：按笔画顺序逐笔画出标题（总时长 3 秒）
-            (function animateTitleStrokes() {
-                const svg = document.getElementById('login-title-svg');
-                if (!svg) return;
-                svg.style.opacity = '1';
-                const TOTAL_MS = 3000, GAP = 25;
-                const items = [...svg.querySelectorAll('path')]
-                    .map((p) => {
-                        let len = 0;
-                        try { len = p.getTotalLength(); } catch (e) {}
-                        return { p, len };
-                    })
-                    .filter((i) => i.len > 0);
-                if (!items.length) return;
-                const sum = items.reduce((a, i) => a + i.len, 0);
-                const drawBudget = TOTAL_MS - GAP * (items.length - 1);
-                setTimeout(() => svg.classList.add('title-pink'), TOTAL_MS + 120);
-                setTimeout(() => { svg.classList.remove('title-pink'); svg.classList.add('title-bold'); }, TOTAL_MS + 1500);
-                let t = 0;
-                items.forEach((i) => {
-                    i.p.style.strokeDasharray = i.len;
-                    i.p.style.strokeDashoffset = i.len;
-                    const dur = Math.max(50, drawBudget * i.len / sum);
-                    i.p.animate(
-                        [{ strokeDashoffset: i.len }, { strokeDashoffset: 0 }],
-                        { duration: dur, delay: t, easing: 'ease-in-out', fill: 'forwards' }
-                    );
-                    t += dur + GAP;
-                });
-            })();
-
-
-            const sidebar = document.getElementById('sidebar');
-            const chatArea = document.getElementById('chat-area');
-            const backBtn = document.getElementById('back-btn');
-
-            const statusDot = document.getElementById('status-dot');
-            const statusText = document.getElementById('status-text');
-            const contactList = document.getElementById('contact-list');
-            const emptyContact = document.getElementById('empty-contact');
-            const currentChatName = document.getElementById('current-chat-name');
-            const messageArea = document.getElementById('message-area');
-            const inputBox = document.getElementById('input-box');
-            const sendBtn = document.getElementById('send-btn');
-            const contextMenu = document.getElementById('context-menu');
-            const ctxRecall = document.getElementById('ctx-recall');
-            const quotePreview = document.getElementById('quote-preview');
-            const quoteText = document.getElementById('quote-text');
-
-            const filePreviewArea = document.getElementById('file-preview-area');
-            const previewImg = document.getElementById('preview-img');
-            const previewFileIcon = document.getElementById('preview-file-icon');
-            const previewFilename = document.getElementById('preview-filename');
-            const previewFilesize = document.getElementById('preview-filesize');
-            const uploadProgressBar = document.getElementById('upload-progress-bar');
-            const previewPercent = document.getElementById('preview-percent');
-
-            const imageInput = document.getElementById('image-input');
-            const fileInput = document.getElementById('file-input');
-            const dropOverlay = document.getElementById('drop-overlay');
-
-            document.addEventListener('dragover', (e) => { e.preventDefault(); });
-            document.addEventListener('drop', (e) => { e.preventDefault(); });
-
-            if (chatArea) {
-                chatArea.addEventListener('dragover', (e) => {
-                    e.preventDefault();
-                    dropOverlay.classList.add('show');
-                });
-                chatArea.addEventListener('dragleave', (e) => {
-                    e.preventDefault();
-                    dropOverlay.classList.remove('show');
-                });
-                chatArea.addEventListener('drop', (e) => {
-                    e.preventDefault();
-                    dropOverlay.classList.remove('show');
-                    if (!currentTargetId) { alert('请先在左侧选择联系人'); return; }
-                    if (!isNapcatOnline) { alert('NapCat 未连接，无法上传'); return; }
-                    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-                        const file = e.dataTransfer.files[0];
-                        const isImage = file.type.startsWith('image/');
-                        handleFileSelect(file, isImage);
-                    }
-                });
-            }
-
-            if (backBtn) {
-                backBtn.onclick = () => {
-                    chatArea.classList.add('hidden');
-                    chatArea.classList.remove('flex');
-                    sidebar.classList.remove('hidden');
-                    currentTargetId = null;
-                };
-            }
-
-            if (inputBox) {
-                inputBox.addEventListener('input', function() {
-                    this.style.height = 'auto';
-                    this.style.height = Math.min(this.scrollHeight, 120) + 'px';
-                });
-            }
-
-            document.getElementById('btn-image').onclick = () => {
-                if(!currentTargetId) { alert('请先在左侧选择联系人'); return; }
-                if(!isNapcatOnline) { alert('NapCat 未连接'); return; }
-                imageInput.click();
-            };
-            document.getElementById('btn-file').onclick = () => {
-                if(!currentTargetId) { alert('请先在左侧选择联系人'); return; }
-                if(!isNapcatOnline) { alert('NapCat 未连接'); return; }
-                fileInput.click();
-            };
-
-            function formatSize(bytes) {
-                if (bytes < 1024) return bytes + ' B';
-                else if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
-                else return (bytes / 1048576).toFixed(1) + ' MB';
-            }
-
-            function handleFileSelect(file, isImage) {
-                if (!file) return;
-                if (file.size > 50 * 1024 * 1024) {
-                    alert('文件过大，限制 50MB');
-                    return;
-                }
-
-                if (currentXHR) {
-                    try { currentXHR.abort(); } catch (e) {}
-                    currentXHR = null;
-                }
-
-                pendingFile = { name: file.name, size: file.size, is_image: isImage, local_path: null };
-                previewFilename.innerText = file.name;
-                previewFilesize.innerText = formatSize(file.size);
-
-                if (isImage) {
-                    previewImg.src = URL.createObjectURL(file);
-                    previewImg.classList.remove('hidden');
-                    previewFileIcon.classList.add('hidden');
-                } else {
-                    previewImg.classList.add('hidden');
-                    previewFileIcon.classList.remove('hidden');
-                }
-
-                uploadProgressBar.style.width = '0%';
-                previewPercent.innerText = '准备中...';
-                previewPercent.classList.remove('hidden');
-                filePreviewArea.classList.remove('hidden');
-
-                const xhr = new XMLHttpRequest();
-                currentXHR = xhr;
-
-                xhr.open('POST', '/api/upload', true);
-
-                const formData = new FormData();
-                formData.append(isImage ? 'image' : 'file', file);
-
-                xhr.timeout = 60000;
-
-                xhr.upload.onprogress = function(e) {
-                    if (e.lengthComputable) {
-                        const percent = Math.round((e.loaded / e.total) * 100);
-                        uploadProgressBar.style.width = percent + '%';
-                        previewPercent.innerText = percent + '%';
-                    }
-                };
-
-                xhr.onload = function() {
-                    if (xhr.status === 200) {
-                        try {
-                            const data = JSON.parse(xhr.responseText);
-                            pendingFile.url = data.url;
-                            pendingFile.local_path = data.local_path;
-                            uploadProgressBar.style.width = '100%';
-                            previewPercent.innerText = '完成';
-                            setTimeout(() => {
-                                uploadProgressBar.style.width = '0%';
-                                previewPercent.classList.add('hidden');
-                            }, 1000);
-                        } catch (err) {
-                            alert('解析服务器响应失败：' + xhr.responseText);
-                            cancelFile();
-                        }
-                    } else {
-                        let errMsg = '上传失败，HTTP 状态码: ' + xhr.status;
-                        try {
-                            const errData = JSON.parse(xhr.responseText);
-                            if (errData.error) errMsg += '\\n具体原因: ' + errData.error;
-                        } catch(e) {}
-                        alert(errMsg);
-                        cancelFile();
-                    }
-                };
-
-                xhr.onerror = function() { alert('上传网络错误或跨域被拦截'); cancelFile(); };
-                xhr.ontimeout = function() { alert('上传超时！服务器可能未响应'); cancelFile(); };
-
-                xhr.send(formData);
-            }
-
-            imageInput.onchange = (e) => handleFileSelect(e.target.files[0], true);
-            fileInput.onchange = (e) => handleFileSelect(e.target.files[0], false);
-
-            document.getElementById('cancel-file').onclick = cancelFile;
-            function cancelFile() {
-                if (currentXHR) {
-                    try { currentXHR.abort(); } catch (e) {}
-                    currentXHR = null;
-                }
-                pendingFile = null;
-                filePreviewArea.classList.add('hidden');
-                previewImg.src = '';
-                imageInput.value = '';
-                fileInput.value = '';
-            }
-
-            window.addEventListener('paste', async function(e) {
-                if (!currentTargetId || !isNapcatOnline) return;
-                const clipboardData = e.clipboardData || e.originalEvent.clipboardData;
-                let blob = null;
-
-                if (clipboardData.items) {
-                    for (let i = 0; i < clipboardData.items.length; i++) {
-                        if (clipboardData.items[i].type.indexOf('image') !== -1) {
-                            blob = clipboardData.items[i].getAsFile();
-                            break;
-                        }
-                    }
-                }
-                if (blob) {
-                    e.preventDefault();
-                    blob.name = 'paste.png';
-                    handleFileSelect(blob, true);
-                }
-            });
-
-            document.addEventListener('click', hideContextMenu);
-            function hideContextMenu() { contextMenu.classList.remove('show'); }
-
-            function showToast(msg) {
-                let toast = document.createElement('div');
-                toast.className = 'toast';
-                toast.innerText = msg;
-                document.body.appendChild(toast);
-                setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, 2000);
-            }
-
-            // 粉色粒子连线背景（canvas-nest 原版算法）
-            (function canvasNest() {
-                const host = document.getElementById('login-bg');
-                const overlay = document.getElementById('login-overlay');
-                if (!host || !overlay) return;
-
-                function l() {
-                    return { l: 0, z: 0, o: 0.55, c: '244,114,182', n: 150 };
-                }
-                function k() {
-                    r = u.width = host.clientWidth;
-                    n = u.height = host.clientHeight;
-                }
-                function b() {
-                    if (overlay.style.display === 'none') return;
-                    requestAnimationFrame(b);
-                    if (!r || !n) { k(); return; }
-                    e.clearRect(0, 0, r, n);
-                    var w = [f].concat(t);
-                    var x, v, A, B, z, y;
-                    t.forEach(function(i) {
-                        i.x += i.xa;
-                        i.y += i.ya;
-                        i.xa *= i.x > r || i.x < 0 ? -1 : 1;
-                        i.ya *= i.y > n || i.y < 0 ? -1 : 1;
-                        e.fillStyle = 'rgba(' + s.c + ',0.9)';
-                        e.fillRect(i.x - 0.5, i.y - 0.5, 1, 1);
-                        for (v = 0; v < w.length; v++) {
-                            x = w[v];
-                            if (i !== x && null !== x.x && null !== x.y) {
-                                B = i.x - x.x;
-                                z = i.y - x.y;
-                                y = B * B + z * z;
-                                if (y < x.max) {
-                                    if (x === f && y >= x.max / 2) {
-                                        i.x -= 0.03 * B;
-                                        i.y -= 0.03 * z;
-                                    }
-                                    A = (x.max - y) / x.max;
-                                    e.beginPath();
-                                    e.lineWidth = 0.8 + A * 0.6;
-                                    e.strokeStyle = 'rgba(' + s.c + ',' + (A + 0.2) + ')';
-                                    e.moveTo(i.x, i.y);
-                                    e.lineTo(x.x, x.y);
-                                    e.stroke();
-                                }
-                            }
-                        }
-                        w.splice(w.indexOf(i), 1);
-                    });
-                }
-
-                var u = document.createElement('canvas');
-                var s = l();
-                var e = u.getContext('2d');
-                var r, n;
-                var f = { x: null, y: null, max: 20000 };
-                var a = Math.random;
-                u.id = 'c_n' + s.l;
-                u.style.cssText = 'position:absolute;top:0;left:0;z-index:0;opacity:' + s.o;
-                host.appendChild(u);
-                k();
-                window.addEventListener('resize', k);
-                window.addEventListener('mousemove', function(i) {
-                    i = i || window.event;
-                    f.x = i.clientX;
-                    f.y = i.clientY;
-                });
-                window.addEventListener('mouseout', function() {
-                    f.x = null;
-                    f.y = null;
-                });
-                for (var t = [], p = 0; s.n > p; p++) {
-                    var h = a() * r;
-                    var g = a() * n;
-                    var q = 2 * a() - 1;
-                    var d = 2 * a() - 1;
-                    t.push({ x: h, y: g, xa: q, ya: d, max: 6000 });
-                }
-                window.__nestStart = function() { requestAnimationFrame(b); };
-                setTimeout(function() { b(); }, 100);
-            })();
-
-            function updateWallpaperView() {
-                if (!uiCfg) return;
-                const img = document.getElementById('login-bg-img');
-                if (img) {
-                    if (uiCfg.use_image_host && wallpaperUrl) {
-                        if (img.getAttribute('src') !== wallpaperUrl) {
-                            clearTimeout(wallpaperRevealTimer);
-                            img.src = wallpaperUrl;
-                        }
-                        const wait = Math.max(0, 3000 - performance.now());
-                        clearTimeout(wallpaperRevealTimer);
-                        if (wait > 0) {
-                            const shownUrl = wallpaperUrl;
-                            wallpaperRevealTimer = setTimeout(function() {
-                                if (uiCfg.use_image_host && wallpaperUrl === shownUrl) img.style.opacity = '1';
-                            }, wait);
-                        } else {
-                            img.style.opacity = '1';
-                        }
-                    } else {
-                        clearTimeout(wallpaperRevealTimer);
-                        img.style.opacity = '0';
-                        img.removeAttribute('src');
-                    }
-                }
-                if (uiCfg.chat_background && wallpaperUrl) {
-                    document.body.classList.add('chat-bg-on');
-                    if (document.body.getAttribute('data-chat-background') !== wallpaperUrl) {
-                        document.body.style.setProperty('--chat-wallpaper', 'url("' + wallpaperUrl + '")');
-                        document.body.setAttribute('data-chat-background', wallpaperUrl);
-                    }
-                } else {
-                    document.body.classList.remove('chat-bg-on');
-                    document.body.style.removeProperty('--chat-wallpaper');
-                    document.body.removeAttribute('data-chat-background');
-                }
-                const visible = !!authToken && loginOverlay.style.display === 'none';
-                saveWallpaperBtn.hidden = !visible;
-                saveWallpaperBtn.disabled = !(visible && uiCfg.chat_background && wallpaperBlob);
-                document.body.classList.toggle('wallpaper-save-visible', visible);
-                refreshBgBtn.disabled = !!wallpaperRequest;
-            }
-
-            function ensureWallpaper(forceRefresh = false) {
-                if (!uiCfg.use_image_host && !uiCfg.chat_background) return Promise.resolve(false);
-                if (wallpaperRequest) return wallpaperRequest;
-                if (wallpaperBlob && !forceRefresh) {
-                    updateWallpaperView();
-                    return Promise.resolve(true);
-                }
-                const variant = window.matchMedia('(max-width: 768px)').matches ? 'mobile' : 'desktop';
-                const tip = document.getElementById('bg-error');
-                if (tip) tip.classList.remove('show');
-                wallpaperRequest = (async function() {
-                    let candidateUrl = null;
-                    try {
-                        const response = await fetch('/api/wallpaper?variant=' + variant, {cache: 'no-store'});
-                        if (!response.ok) throw new Error('Wallpaper request failed');
-                        const blob = await response.blob();
-                        if (!blob.size || blob.type.indexOf('image/') !== 0) throw new Error('Invalid wallpaper');
-                        candidateUrl = URL.createObjectURL(blob);
-                        await new Promise(function(resolve, reject) {
-                            const image = new Image();
-                            image.onload = resolve;
-                            image.onerror = function() { reject(new Error('Wallpaper decode failed')); };
-                            image.src = candidateUrl;
-                        });
-                        const oldUrl = wallpaperUrl;
-                        wallpaperBlob = blob;
-                        wallpaperUrl = candidateUrl;
-                        candidateUrl = null;
-                        updateWallpaperView();
-                        if (oldUrl) URL.revokeObjectURL(oldUrl);
-                        return true;
-                    } catch (e) {
-                        if (candidateUrl) URL.revokeObjectURL(candidateUrl);
-                        if (!wallpaperBlob && uiCfg.use_image_host && tip) tip.classList.add('show');
-                        if (forceRefresh) showToast('壁纸加载失败，已保留当前壁纸');
-                        return false;
-                    } finally {
-                        wallpaperRequest = null;
-                        updateWallpaperView();
-                    }
-                })();
-                updateWallpaperView();
-                return wallpaperRequest;
-            }
-
-            function saveCurrentWallpaper() {
-                if (!authToken || !uiCfg.chat_background || !wallpaperBlob || saveWallpaperBtn.disabled) return;
-                const types = {'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'image/avif': 'avif'};
-                const downloadUrl = URL.createObjectURL(wallpaperBlob);
-                const link = document.createElement('a');
-                link.href = downloadUrl;
-                link.download = 'QQ-Web-Chat-wallpaper-' + Date.now() + '.' + (types[wallpaperBlob.type] || 'img');
-                link.style.display = 'none';
-                document.body.appendChild(link);
-                link.click();
-                link.remove();
-                setTimeout(function() { URL.revokeObjectURL(downloadUrl); }, 60000);
-            }
-
-            async function sha256Hex(text) {
-                try {
-                    if (window.crypto && window.crypto.subtle && window.crypto.subtle.digest) {
-                        const buf = new TextEncoder().encode(text);
-                        const d = await window.crypto.subtle.digest('SHA-256', buf);
-                        return Array.from(new Uint8Array(d)).map(function(b) { return b.toString(16).padStart(2, '0'); }).join('');
-                    }
-                } catch (e) {}
-                return null;
-            }
-
-            async function doLogin() {
-                const pwd = loginPwd.value.trim();
-                if (!pwd) { alert('请输入密码'); return; }
-                loginBtn.innerText = '验证中...';
-                loginBtn.disabled = true;
-                try {
-                    const hash = await sha256Hex(pwd);
-                    const res = await fetch('/api/login', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify(hash ? {password_hash: hash} : {password: pwd})
-                    });
-
-                    if (res.ok) {
-                        const data = await res.json();
-                        authToken = data.token;
-                        if(!authToken) {
-                            alert("后端未返回 Token，请检查后端代码是否更新！");
-                            return;
-                        }
-                        localStorage.setItem('webchat_token', authToken);
-                        loginOverlay.style.display = 'none';
-                        updateWallpaperView();
-                        resetSettingsCache();
-                        loadSettings();
-                        connect();
-                    } else {
-                        const errData = await res.json().catch(() => ({}));
-                        alert('登录失败，状态码: ' + res.status + (errData.msg ? '\\n原因: ' + errData.msg : ''));
-                        loginError.classList.remove('hidden');
-                        loginPwd.value = '';
-                    }
-                } catch (e) {
-                    alert("登录请求失败！\\n错误信息: " + e.message + "\\n请确认 Nginx 配置正确，或按 F12 查看网络面板");
-                    showToast('网络错误');
-                } finally {
-                    loginBtn.innerText = '登录';
-                    loginBtn.disabled = false;
-                }
-            }
-
-            function doLogout() {
-                try {
-                    const x = new XMLHttpRequest();
-                    x.open('POST', '/api/logout', true);
-                    x.setRequestHeader('Content-Type', 'application/json');
-                    x.send(JSON.stringify({ token: authToken }));
-                } catch (e) {}
-                if (ws) {
-                    ws.onclose = null;
-                    try { ws.close(); } catch (e) {}
-                    ws = null;
-                }
-                clearTimeout(reconnectTimeout);
-                clearInterval(countdownInterval);
-                if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-                reconnectStartedAt = 0;
-                localStorage.removeItem('webchat_token');
-                authToken = null;
-                resetSettingsCache();
-                wsStatus = 'closed';
-                currentTargetId = null;
-                unreadCounts = {};
-                saveUnread();
-                quoteMsg = null;
-                messageArea.innerHTML = '';
-                loginPwd.value = '';
-                loginError.classList.add('hidden');
-                loginError.innerText = '';
-                loginBtn.innerText = '登录';
-                loginBtn.disabled = false;
-                loginOverlay.style.display = 'flex';
-                updateWallpaperView();
-                var introCard = document.getElementById('login-card');
-                if (introCard) { introCard.style.pointerEvents = 'auto'; }
-                if (window.__nestStart) { window.__nestStart(); }
-                updateStatusUI();
-            }
-
-            if (logoutBtn) logoutBtn.addEventListener('click', doLogout);
-            if (settingsBtn) settingsBtn.addEventListener('click', openSettings);
-            if (refreshBgBtn) refreshBgBtn.addEventListener('click', async function() {
-                if (!uiCfg.chat_background) { showToast('请先在设置中开启聊天背景'); return; }
-                if (wallpaperRequest) return;
-                if (await ensureWallpaper(true)) showToast('壁纸已刷新');
-            });
-            if (saveWallpaperBtn) saveWallpaperBtn.addEventListener('click', saveCurrentWallpaper);
-            loginBtn.addEventListener('click', doLogin);
-            loginPwd.addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
-
-            if (!authToken) {
-                loginOverlay.style.display = 'flex';
-            } else {
-                loginOverlay.style.display = 'none';
-                fetch('/api/restore', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({token:authToken})}).then(() => connect()).catch(() => connect());
-            }
-
-            function connect() {
-                wsStatus = 'connecting';
-                if (!reconnectStartedAt) { updateStatusUI(); }
-
-                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                try {
-                    ws = new WebSocket(`${protocol}//${window.location.host}/client_ws?token=${encodeURIComponent(authToken)}`);
-                } catch (e) {
-                    startReconnect();
-                    return;
-                }
-
-                ws.onopen = () => {
-                    wsStatus = 'open';
-                    reconnectStartedAt = 0;
-                    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-                    updateStatusUI();
-                    clearTimeout(reconnectTimeout);
-                    clearInterval(countdownInterval);
-                    if (currentTargetId) ws.send(JSON.stringify({type: 'get_history', target_id: currentTargetId}));
-                };
-
-                ws.onmessage = (event) => {
-                    const data = JSON.parse(event.data);
-                    if (data.type === 'status') {
-                        isNapcatOnline = data.connected;
-                        if (data.self_id) myQQ = data.self_id;
-                        updateStatusUI(data.error, data.self_id);
-                    }
-                    else if (data.type === 'contact_add') addContact(data.contact);
-                    else if (data.type === 'message') appendMessage(data);
-                    else if (data.type === 'toast') showToast(data.content);
-                    else if (data.type === 'clear_history') {
-                        if (data.target_id === currentTargetId) messageArea.innerHTML = '';
-                    }
-                    else if (data.type === 'message_recalled') updateRecallUI(data.message_id, data.sender_name);
-                    else if (data.type === 'history_data') {
-                        if (data.target_id === currentTargetId) {
-                            messageArea.innerHTML = '';
-                            data.messages.forEach(msg => appendMessage(msg, false));
-                            setTimeout(() => { messageArea.scrollTop = messageArea.scrollHeight; }, 50);
-                        }
-                    }
-                };
-
-                ws.onclose = (e) => {
-                    if (e.code === 1008) {
-                        localStorage.removeItem('webchat_token');
-                        authToken = null;
-                        resetSettingsCache();
-                        loginOverlay.style.display = 'flex';
-                        updateWallpaperView();
-                        loginError.classList.remove('hidden');
-                        loginError.innerText = "登录已过期，请重新输入密码";
-                    } else {
-                        wsStatus = 'closed';
-                        startReconnect();
-                    }
-                };
-            }
-
-            var reconnectStartedAt = 0;
-            var reconnectTimer = null;
-
-            function startReconnect() {
-                if (!reconnectStartedAt) { reconnectStartedAt = Date.now(); }
-                const elapsed = Date.now() - reconnectStartedAt;
-                if (elapsed >= 10000) {
-                    statusDot.className = 'w-3 h-3 rounded-full bg-red-500 mr-2 shadow-sm shrink-0';
-                    statusText.className = 'text-sm font-semibold text-red-500 truncate';
-                    statusText.innerText = 'NapCat 未连接';
-                } else if (elapsed >= 5000) {
-                    statusDot.className = 'w-3 h-3 rounded-full bg-yellow-500 mr-2 shadow-[0_0_8px_rgba(234,179,8,0.6)] shrink-0';
-                    statusText.className = 'text-sm font-semibold text-yellow-600 truncate';
-                    statusText.innerText = '连不上服务器，正在重试...';
-                }
-                if (reconnectTimer) { return; }
-                const delay = elapsed >= 10000 ? 5000 : 1000;
-                reconnectTimer = setTimeout(() => {
-                    reconnectTimer = null;
-                    if (authToken) { connect(); }
-                }, delay);
-            }
-
-            function updateStatusUI(errorMsg = null, selfId = null, countdown = null) {
-                if (wsStatus === 'closed' || wsStatus === 'connecting' || wsStatus === 'timeout') {
-                    statusDot.className = 'w-3 h-3 rounded-full bg-yellow-500 mr-2 shadow-[0_0_8px_rgba(234,179,8,0.6)] shrink-0';
-                    statusText.className = 'text-sm font-semibold text-yellow-600 truncate';
-                    if (countdown !== null) {
-                        if (countdown > 0) {
-                            statusText.innerText = `正在重连服务器... (${countdown}s)`;
-                        } else {
-                            statusText.innerText = '服务端异常，请刷新网页';
-                            statusDot.className = 'w-3 h-3 rounded-full bg-red-500 mr-2 shadow-sm shrink-0';
-                        }
-                    } else {
-                        statusText.innerText = '正在连接服务器...';
-                    }
-                    return;
-                }
-
-                if (isNapcatOnline) {
-                    statusDot.className = 'w-3 h-3 rounded-full bg-green-500 mr-2 shadow-[0_0_8px_rgba(34,197,94,0.6)] shrink-0';
-                    statusText.className = 'text-sm font-semibold text-gray-600 truncate';
-                    if (selfId) {
-                        statusText.innerText = `NapCat已连接，后端QQ号：${selfId}`;
-                    } else {
-                        statusText.innerText = 'NapCat已连接，获取QQ号中...';
-                    }
-                } else {
-                    statusDot.className = 'w-3 h-3 rounded-full bg-red-500 mr-2 shadow-[0_0_8px_rgba(239,68,68,0.6)] shrink-0';
-                    statusText.className = 'text-sm font-semibold text-red-500 truncate';
-                    if (errorMsg) {
-                        statusText.innerText = `NapCat 异常: ${errorMsg}`;
-                    } else {
-                        statusText.innerText = 'NapCat未连接';
-                    }
-                }
-            }
-
-            function isSelfSender(name) {
-                if (name === '我') return true;
-                return myQQ !== null && String(name) === String(myQQ);
-            }
-
-            function addContact(contact) {
-                contacts[contact.id] = contact;
-                if (unreadCounts[contact.id] === undefined) unreadCounts[contact.id] = 0;
-                if (emptyContact) emptyContact.style.display = 'none';
-
-                let div = document.getElementById(`contact-${contact.id}`);
-                if (!div) {
-                    div = document.createElement('div');
-                    div.className = 'flex items-center p-3 rounded-lg cursor-pointer hover:bg-gray-100 transition-colors relative';
-                    div.id = `contact-${contact.id}`;
-                    div.onclick = () => switchChat(contacts[contact.id]);
-                    contactList.appendChild(div);
-                }
-
-                const avatarText = escapeHTML((contact.name || '?').charAt(0));
-                const avatarHTML = contact.avatar
-                    ? `<img src="${escapeHTML(contact.avatar)}" alt="" referrerpolicy="no-referrer" class="w-10 h-10 rounded-full object-cover bg-gray-200" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';"><div class="w-10 h-10 rounded-full bg-blue-500 text-white items-center justify-center font-bold hidden">${avatarText}</div>`
-                    : `<div class="w-10 h-10 rounded-full bg-blue-500 text-white flex items-center justify-center font-bold">${avatarText}</div>`;
-
-                div.innerHTML = `
-                    <div class="relative shrink-0 mr-3">
-                        ${avatarHTML}
-                        <span id="unread-${contact.id}" class="hidden absolute -top-1 -right-1 bg-red-500 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full border-2 border-white shadow-sm"></span>
-                    </div>
-                    <div class="flex-1 overflow-hidden">
-                        <div class="text-sm font-semibold truncate text-gray-700">${escapeHTML(contact.name)}</div>
-                        <div class="text-xs text-gray-400 truncate">ID: ${escapeHTML(contact.id)}</div>
-                    </div>
-                `;
-                updateUnreadBadge(contact.id);
-                if (contact.id === currentTargetId) currentChatName.innerText = contact.name || '';
-            }
-
-            function updateUnreadBadge(contactId) {
-                const badge = document.getElementById(`unread-${contactId}`);
-                if (badge) {
-                    const count = unreadCounts[contactId] || 0;
-                    if (count > 0) {
-                        badge.innerText = count > 99 ? '99+' : count;
-                        badge.classList.remove('hidden');
-                    } else {
-                        badge.classList.add('hidden');
-                    }
-                }
-            }
-
-            function switchChat(contact) {
-                currentTargetId = contact.id;
-                currentMsgType = contact.type;
-                currentChatName.innerText = contact.name;
-                cancelQuote();
-                cancelFile();
-
-                unreadCounts[contact.id] = 0;
-                updateUnreadBadge(contact.id);
-                saveUnread();
-
-                if (window.innerWidth < 768) {
-                    sidebar.classList.add('hidden');
-                    chatArea.classList.remove('hidden');
-                    chatArea.classList.add('flex');
-                }
-
-                document.querySelectorAll('#contact-list > div').forEach(el => el.classList.remove('bg-blue-50', 'border-l-4', 'border-blue-500'));
-                const activeEl = document.getElementById(`contact-${contact.id}`);
-                if (activeEl) activeEl.classList.add('bg-blue-50', 'border-l-4', 'border-blue-500');
-
-                messageArea.innerHTML = '<div class="text-center text-gray-400 text-sm mt-4">加载中...</div>';
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({ type: 'get_history', target_id: currentTargetId }));
-                }
-
-                inputBox.disabled = false;
-                sendBtn.disabled = false;
-                inputBox.focus();
-            }
-
-            function appendMessage(data, scroll = true) {
-                if (!isSelfSender(data.sender_name) && scroll !== false) { playNotifySound(); }
-                if (data.target_id !== currentTargetId) {
-                    if (!isSelfSender(data.sender_name)) {
-                        if (!unreadCounts[data.target_id]) unreadCounts[data.target_id] = 0;
-                        unreadCounts[data.target_id]++;
-                        updateUnreadBadge(data.target_id);
-                        saveUnread();
-                    }
-                    return;
-                }
-
-                if (messageArea.innerText.includes('加载中')) messageArea.innerHTML = '';
-
-                const isSelf = isSelfSender(data.sender_name);
-                const row = document.createElement('div');
-                row.className = `w-full flex mb-4 ${isSelf ? 'justify-end' : 'justify-start'}`;
-                row.id = `msg-${data.message_id}`;
-
-                if (data.is_recalled) {
-                    row.className = 'w-full flex justify-center mb-4';
-                    row.innerHTML = `<div class="text-xs text-gray-400 bg-gray-200 px-3 py-1 rounded-full">${escapeHTML(data.content)}</div>`;
-                    messageArea.appendChild(row);
-                    if(scroll) messageArea.scrollTop = messageArea.scrollHeight;
-                    return;
-                }
-
-                const col = document.createElement('div');
-                col.className = `flex flex-col ${isSelf ? 'items-end' : 'items-start'} max-w-[85%] md:max-w-[75%]`;
-
-                const meta = document.createElement('div');
-                meta.className = 'text-[10px] md:text-xs text-gray-400 mb-1 px-1 whitespace-nowrap';
-                meta.innerText = `${isSelf ? (myQQ !== null ? String(myQQ) : '我') : data.sender_name} · ${data.time}`;
-
-                const bubble = document.createElement('div');
-                const isImage = !!data.media_url && !data.file_name;
-                bubble.className = `rounded-2xl text-sm break-words shadow-sm whitespace-pre-wrap cursor-context-menu ${
-                    isImage ? 'p-1 bg-transparent border-none shadow-none' :
-                    (isSelf ? 'bg-blue-500 text-white rounded-tr-sm px-3 py-1.5 md:px-4 md:py-2' : 'bg-white border border-gray-200 text-gray-800 rounded-tl-sm px-3 py-1.5 md:px-4 md:py-2')
-                }`;
-                bubble.style.width = 'fit-content';
-                bubble.style.maxWidth = '100%';
-                bubble.style.wordBreak = 'break-word';
-
-                if (data.quote) {
-                    let quoteDiv = document.createElement('div');
-                    quoteDiv.className = 'mb-2 px-2 py-1.5 rounded text-xs border-l-4 border-gray-400/50 bg-black/10 opacity-90 truncate cursor-pointer hover:opacity-100 transition-opacity';
-                    quoteDiv.innerHTML = `<span class="font-semibold">${escapeHTML(data.quote.sender_name)}</span>: ${escapeHTML(data.quote.content)}`;
-                    quoteDiv.onclick = (e) => {
-                        e.stopPropagation();
-                        const targetRow = document.getElementById(`msg-${data.quote.id}`);
-                        if (targetRow) {
-                            targetRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                            targetRow.style.transition = 'background-color 0.3s';
-                            targetRow.style.backgroundColor = 'rgba(59, 130, 246, 0.1)';
-                            setTimeout(() => { targetRow.style.backgroundColor = 'transparent'; }, 1500);
-                        } else {
-                            showToast('引用的消息已不在当前会话中');
-                        }
-                    };
-                    bubble.appendChild(quoteDiv);
-                }
-
-                if (isImage) {
-                    let extraText = data.content.replace(/\\[图片\\]/g, "").replace(/\\[表情包\\]/g, "").trim();
-                    let img = document.createElement('img');
-                    img.className = 'max-w-full rounded-md object-contain max-h-[200px] md:max-h-60';
-                    const imgSrc = data.media_url.startsWith('/files/') ? data.media_url : `/proxy_img?url=${encodeURIComponent(data.media_url)}`;
-                    let holder = document.createElement('div');
-                    holder.className = 'px-4 py-3 bg-gray-100 text-gray-400 text-sm rounded-lg border border-gray-200 text-center w-32 h-32 flex items-center justify-center';
-                    holder.innerText = '加载中...';
-                    bubble.appendChild(holder);
-                    fetch(imgSrc).then(resp => { if (!resp.ok) throw new Error('http'); return resp.blob(); }).then(blob => {
-                        img.onload = () => { holder.replaceWith(img); };
-                        img.onerror = () => { holder.innerText = '[图片已失效]'; };
-                        img.src = URL.createObjectURL(blob);
-                    }).catch(() => { holder.innerText = '[图片已失效]'; });
-                    if (extraText) {
-                        let textDiv = document.createElement('div');
-                        textDiv.className = `mt-1 px-2 py-1 ${isSelf ? 'bg-blue-500 text-white rounded-lg' : 'bg-white text-gray-800 rounded-lg border border-gray-200'}`;
-                        textDiv.innerText = extraText;
-                        bubble.appendChild(textDiv);
-                    }
-                } else if (data.file_name) {
-                    let fileRow = document.createElement('div');
-                    fileRow.className = 'flex items-center gap-2 py-0.5';
-                    let iconWrap = document.createElement('div');
-                    iconWrap.className = `w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${isSelf ? 'bg-white/20' : 'bg-blue-50'}`;
-                    iconWrap.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-5 h-5 ${isSelf ? 'text-white' : 'text-blue-500'}"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>`;
-                    let info = document.createElement('div');
-                    info.className = 'min-w-0 flex-1 max-w-[200px] md:max-w-[280px]';
-                    let nameEl;
-                    if (typeof data.file_url === 'string' && (/^https?:\\/\\//i.test(data.file_url) || /^\\/files\\/[a-zA-Z0-9_.-]+$/.test(data.file_url))) {
-                        nameEl = document.createElement('a');
-                        if (/^https?:/i.test(data.file_url)) {
-                            nameEl.href = `/download?url=${encodeURIComponent(data.file_url)}&name=${encodeURIComponent(data.file_name || 'file')}`;
-                        } else {
-                            nameEl.href = data.file_url;
-                        }
-                        nameEl.target = '_blank';
-                        nameEl.rel = 'noopener';
-                        nameEl.download = data.file_name;
-                        nameEl.className = `block text-sm font-medium truncate ${isSelf ? 'text-white hover:underline' : 'text-gray-800 hover:text-blue-600 hover:underline'}`;
-                    } else {
-                        nameEl = document.createElement('span');
-                        nameEl.className = `block text-sm font-medium truncate ${isSelf ? 'text-white' : 'text-gray-800'}`;
-                    }
-                    nameEl.title = data.file_name;
-                    nameEl.textContent = data.file_name;
-                    info.appendChild(nameEl);
-                    let sizeEl = document.createElement('div');
-                    sizeEl.className = `text-[11px] ${isSelf ? 'text-white/70' : 'text-gray-400'}`;
-                    sizeEl.textContent = data.file_size ? formatSize(data.file_size) : '文件';
-                    info.appendChild(sizeEl);
-                    fileRow.appendChild(iconWrap);
-                    fileRow.appendChild(info);
-                    bubble.appendChild(fileRow);
-                    if (data.content && data.content.indexOf('[文件]') !== 0) {
-                        let extra = document.createElement('div');
-                        extra.className = 'mt-1 whitespace-pre-wrap text-sm';
-                        extra.innerText = data.content;
-                        bubble.appendChild(extra);
-                    }
-                } else {
-                    let textDiv = document.createElement('div');
-                    textDiv.className = 'whitespace-pre-wrap';
-                    textDiv.innerText = data.content;
-                    bubble.appendChild(textDiv);
-                }
-
-                bubble.addEventListener('contextmenu', (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    contextMenuMsg = data;
-
-                    if (isSelf) {
-                        ctxRecall.style.display = 'block';
-                    } else {
-                        ctxRecall.style.display = 'none';
-                    }
-
-                    contextMenu.style.visibility = 'hidden';
-                    contextMenu.classList.add('show');
-
-                    const menuWidth = contextMenu.offsetWidth;
-                    const menuHeight = contextMenu.offsetHeight;
-
-                    let left = e.clientX;
-                    let top = e.clientY;
-
-                    if (isSelf) left = e.clientX - menuWidth;
-
-                    if (left + menuWidth > window.innerWidth) left = left - menuWidth;
-                    if (top + menuHeight > window.innerHeight) top = top - menuHeight;
-
-                    contextMenu.style.left = left + 'px';
-                    contextMenu.style.top = top + 'px';
-                    contextMenu.style.visibility = 'visible';
-                });
-
-                col.appendChild(meta);
-                col.appendChild(bubble);
-                row.appendChild(col);
-                messageArea.appendChild(row);
-                if(scroll) messageArea.scrollTop = messageArea.scrollHeight;
-            }
-
-            function updateRecallUI(messageId, senderName) {
-                const row = document.getElementById(`msg-${messageId}`);
-                if (row) {
-                    const name = senderName || '某人';
-                    row.className = 'w-full flex justify-center mb-4';
-                    row.innerHTML = `<div class="text-xs text-gray-400 bg-gray-200 px-3 py-1 rounded-full">「${escapeHTML(name)}」撤回了一条消息</div>`;
-                }
-            }
-
-            document.getElementById('ctx-reply').onclick = () => {
-                if (!contextMenuMsg) return;
-                quoteMsg = contextMenuMsg;
-                quoteText.innerText = `引用: ${quoteMsg.content}`;
-                quotePreview.classList.remove('hidden');
-                inputBox.focus();
-                hideContextMenu();
-            };
-
-            ctxRecall.onclick = () => {
-                if (!contextMenuMsg) return;
-                ws.send(JSON.stringify({
-                    type: 'recall_message',
-                    target_id: currentTargetId,
-                    message_id: contextMenuMsg.message_id
-                }));
-                hideContextMenu();
-            };
-
-            function cancelQuote() {
-                quoteMsg = null;
-                quotePreview.classList.add('hidden');
-            }
-            document.getElementById('cancel-quote').onclick = cancelQuote;
-
-            function escapeHTML(str) {
-                return str.replace(/[&<>'"]/g, tag => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[tag] || tag));
-            }
-
-            function sendMessage() {
-                const content = inputBox.value.trim();
-                if (!currentTargetId || !ws || ws.readyState !== WebSocket.OPEN) return;
-
-                if (!content && !pendingFile) return;
-
-                if (!isNapcatOnline) {
-                    alert('NapCat 未连接，请检查配置');
-                    return;
-                }
-
-                if (pendingFile && !pendingFile.local_path) {
-                    alert('文件还在上传中，请等待进度条走完！');
-                    return;
-                }
-
-                let quoteObj = null;
-                if (quoteMsg) {
-                    quoteObj = {
-                        "id": quoteMsg.message_id,
-                        "napcat_id": quoteMsg.napcat_message_id || null,
-                        "sender_name": quoteMsg.sender_name,
-                        "content": quoteMsg.content
-                    };
-                }
-
-                ws.send(JSON.stringify({
-                    type: 'send_message',
-                    target_id: currentTargetId,
-                    msg_type: currentMsgType,
-                    content: content,
-                    quote: quoteObj,
-                    file_local_path: pendingFile ? pendingFile.local_path : null,
-                    file_orig_name: pendingFile ? pendingFile.name : null,
-                    file_is_image: pendingFile ? pendingFile.is_image : false
-                }));
-
-                inputBox.value = '';
-                inputBox.style.height = '38px';
-                cancelQuote();
-                cancelFile();
-            }
-
-            sendBtn.addEventListener('click', sendMessage);
-            inputBox.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    sendMessage();
-                }
-            });
-
-            var uiCfg = { use_image_host: true, theme: 'light', theme_auto: false, dark_start: '20:00', dark_end: '07:00', chat_background: false, sound_enabled: true };
-            var settingsData = null, settingsTab = 'whitelist';
-            var savedSettings = null, settingsRequest = null, settingsLoading = false;
-            var settingsLoadError = '', uiSettingsRequest = null;
-            var wallpaperBlob = null, wallpaperUrl = null, wallpaperRequest = null;
-            var wallpaperRevealTimer = null;
-
-            function parseHM(v) {
-                var p = String(v || '00:00').split(':');
-                return (parseInt(p[0], 10) || 0) * 60 + (parseInt(p[1], 10) || 0);
-            }
-            function inDarkRange() {
-                var now = new Date();
-                var cur = now.getHours() * 60 + now.getMinutes();
-                var a = parseHM(uiCfg.dark_start), b = parseHM(uiCfg.dark_end);
-                if (a === b) return false;
-                if (a < b) return cur >= a && cur < b;
-                return cur >= a || cur < b;
-            }
-            function applyTheme() {
-                var dark = uiCfg.theme === 'dark';
-                if (uiCfg.theme_auto) { dark = inDarkRange(); }
-                if (dark) { document.body.classList.add('theme-dark'); } else { document.body.classList.remove('theme-dark'); }
-            }
-            function applyUiCfg(cfg) {
-                if (!cfg) return;
-                uiCfg.use_image_host = cfg.use_image_host !== false;
-                uiCfg.theme = cfg.theme === 'dark' ? 'dark' : 'light';
-                uiCfg.theme_auto = !!cfg.theme_auto;
-                uiCfg.dark_start = cfg.dark_start || '20:00';
-                uiCfg.dark_end = cfg.dark_end || '07:00';
-                uiCfg.chat_background = !!cfg.chat_background;
-                uiCfg.sound_enabled = cfg.sound_enabled !== false;
-                applyTheme();
-                updateWallpaperView();
-                ensureWallpaper();
-            }
-            (function initUiCfg() {
-                var x = new XMLHttpRequest();
-                uiSettingsRequest = x;
-                function finish() {
-                    if (uiSettingsRequest !== x) return;
-                    uiSettingsRequest = null;
-                    if (x.status === 200) {
-                        try { applyUiCfg(JSON.parse(x.responseText)); return; } catch (e) {}
-                    }
-                    applyUiCfg(uiCfg);
-                }
-                try {
-                    x.open('GET', '/api/ui_settings', true);
-                    x.timeout = 8000;
-                    x.onload = finish;
-                    x.onerror = finish;
-                    x.ontimeout = finish;
-                    x.send();
-                } catch (e) { finish(); }
-            })();
-            if (authToken) { loadSettings(); }
-            setInterval(function() { if (uiCfg.theme_auto) { applyTheme(); } }, 30000);
-
-            (function preloadNotifySound() {
-                try {
-                    notifyAudio = new Audio('/static/qq_notify.mp3');
-                    notifyAudio.preload = 'auto';
-                    try { notifyAudio.load(); } catch (e) {}
-                    try { fetch('/static/qq_notify.mp3', { cache: 'force-cache' }).catch(function() {}); } catch (e) {}
-                } catch (e) {}
-            })();
-
-            var notifyAudio = null;
-            function playNotifySound() {
-                if (!uiCfg.sound_enabled) return;
-                try {
-                    if (!notifyAudio) { notifyAudio = new Audio('/static/qq_notify.mp3'); }
-                    notifyAudio.currentTime = 0;
-                    var p = notifyAudio.play();
-                    if (p && p.catch) { p.catch(function() {}); }
-                } catch (e) {}
-            }
-            function testNotifySound() { playNotifySound(); }
-            function openSettings() {
-                var m = document.getElementById('settings-modal');
-                if (!m) return;
-                if (!m.getAttribute('data-bound')) {
-                    m.setAttribute('data-bound', '1');
-                    var mask = document.getElementById('settings-mask');
-                    var cancel = document.getElementById('settings-cancel');
-                    var save = document.getElementById('settings-save');
-                    if (mask) mask.onclick = closeSettings;
-                    if (cancel) cancel.onclick = closeSettings;
-                    if (save) save.onclick = saveSettings;
-                }
-                var alreadyOpen = !m.classList.contains('hidden');
-                m.classList.remove('hidden');
-                updateSettingsTabs();
-                if (!alreadyOpen || !settingsData) {
-                    settingsData = savedSettings ? JSON.parse(JSON.stringify(savedSettings)) : null;
-                }
-                if (settingsData) {
-                    renderSettingsTab(settingsTab);
-                } else {
-                    renderSettingsLoading();
-                    loadSettings();
-                }
-            }
-            function closeSettings() {
-                var m = document.getElementById('settings-modal');
-                if (m) m.classList.add('hidden');
-                settingsData = null;
-            }
-            function renderSettingsLoading() {
-                var el = document.getElementById('settings-body');
-                if (!el) return;
-                if (settingsLoadError) {
-                    el.innerHTML = '<p class="text-sm text-red-500 mb-3">' + escapeAttr(settingsLoadError) + '</p>'
-                        + '<button type="button" id="settings-retry" class="px-3 py-1.5 text-sm rounded-md border border-gray-300 text-gray-600">重试</button>';
-                    document.getElementById('settings-retry').onclick = function() { loadSettings(); };
-                } else {
-                    el.innerHTML = '<p class="text-sm text-gray-400" role="status">正在加载设置…</p>';
-                }
-                document.getElementById('settings-save').disabled = true;
-            }
-            function resetSettingsCache() {
-                var pending = settingsRequest;
-                settingsRequest = null;
-                settingsLoading = false;
-                if (pending) pending.abort();
-                savedSettings = null;
-                settingsLoadError = '';
-                closeSettings();
-            }
-            function updateSettingsTabs() {
-                var tabs = document.querySelectorAll('.set-tab');
-                for (var i = 0; i < tabs.length; i++) {
-                    if (tabs[i].getAttribute('data-tab') === settingsTab) {
-                        tabs[i].className = 'set-tab w-full text-left px-3 py-2 rounded-lg text-sm mb-1 bg-blue-50 text-blue-600 font-semibold';
-                    } else {
-                        tabs[i].className = 'set-tab w-full text-left px-3 py-2 rounded-lg text-sm mb-1 text-gray-600 hover:bg-gray-100';
-                    }
-                }
-            }
-            function switchSettingsTab(tab) {
-                collectSettingsTab();
-                settingsTab = tab;
-                if (settingsData) { renderSettingsTab(tab); } else { renderSettingsLoading(); }
-                updateSettingsTabs();
-            }
-            function loadSettings() {
-                if (!authToken || settingsLoading) return;
-                var requestToken = authToken;
-                var x = new XMLHttpRequest();
-                settingsRequest = x;
-                settingsLoading = true;
-                settingsLoadError = '';
-                function isOpen() {
-                    var modal = document.getElementById('settings-modal');
-                    return modal && !modal.classList.contains('hidden');
-                }
-                if (isOpen() && !settingsData) renderSettingsLoading();
-                function fail(message) {
-                    if (settingsRequest !== x) return;
-                    settingsRequest = null;
-                    settingsLoading = false;
-                    if (authToken !== requestToken) return;
-                    settingsLoadError = message;
-                    if (isOpen()) renderSettingsLoading();
-                }
-                try {
-                    x.open('GET', '/api/settings?token=' + encodeURIComponent(requestToken), true);
-                    x.timeout = 8000;
-                    x.onload = function() {
-                        if (settingsRequest !== x) return;
-                        if (authToken !== requestToken) { fail('登录状态已变化，请重新打开设置'); return; }
-                        if (x.status !== 200) {
-                            fail(x.status === 401 ? '登录已过期，请重新登录' : '设置加载失败，请重试');
-                            return;
-                        }
-                        var cfg;
-                        try {
-                            cfg = JSON.parse(x.responseText);
-                            if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) throw new Error('Invalid settings');
-                        } catch (e) { fail('设置数据无效，请重试'); return; }
-                        settingsRequest = null;
-                        settingsLoading = false;
-                        settingsLoadError = '';
-                        savedSettings = cfg;
-                        if (isOpen()) {
-                            settingsData = JSON.parse(JSON.stringify(savedSettings));
-                            renderSettingsTab(settingsTab);
-                            updateSettingsTabs();
-                        }
-                    };
-                    x.onerror = function() { fail('设置加载失败，请检查网络后重试'); };
-                    x.ontimeout = function() { fail('设置加载超时，请重试'); };
-                    x.send();
-                } catch (e) { fail('设置加载失败，请重试'); }
-            }
-            function escapeAttr(v) {
-                return String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-            }
-            function renderSettingsTab(tab) {
-                if (!settingsData) return;
-                var el = document.getElementById('settings-body');
-                if (!el) return;
-                var h = '';
-                if (tab === 'whitelist') {
-                    h = '<div class="text-sm font-semibold text-gray-800 mb-2">白名单设置</div>'
-                      + '<p class="text-xs text-gray-400 mb-3">只有这些 QQ 号 / 群号的消息才会被处理，多个用分号（;）分割。</p>'
-                      + '<textarea id="set-whitelist" class="w-full h-40 border border-gray-300 rounded-lg p-3 text-sm outline-none focus:border-blue-500" placeholder="123456;789012">' + escapeAttr((settingsData.whitelist || []).join(';')) + '</textarea>';
-                } else if (tab === 'blacklist') {
-                    h = '<div class="text-sm font-semibold text-gray-800 mb-2">黑名单设置</div>'
-                      + '<p class="text-xs text-gray-400 mb-3">这些 QQ 号 / 群号的消息会被完全忽略（不回复、不转发）。多个用分号（;）分割。</p>'
-                      + '<textarea id="set-blacklist" class="w-full h-40 border border-gray-300 rounded-lg p-3 text-sm outline-none focus:border-blue-500" placeholder="QQ ID">' + escapeAttr((settingsData.blacklist || []).join(';')) + '</textarea>';
-                } else if (tab === 'background') {
-                    var yes = settingsData.use_image_host !== false;
-                    var chatBg = !!settingsData.chat_background;
-                    h = '<div class="text-sm font-semibold text-gray-800 mb-2">背景设置</div>'
-                      + '<p class="text-xs text-gray-400 mb-3">登录页背景是否从图床随机加载。</p>'
-                      + '<div class="mb-4"><span class="text-sm mr-4">使用图床：</span>'
-                      + '<label class="inline-flex items-center mr-6"><input type="radio" name="set-bg" value="yes" ' + (yes ? 'checked' : '') + '> <span class="ml-2 text-sm">是</span></label>'
-                      + '<label class="inline-flex items-center"><input type="radio" name="set-bg" value="no" ' + (!yes ? 'checked' : '') + '> <span class="ml-2 text-sm">否</span></label></div>'
-                      + '<div><span class="text-sm mr-4">聊天背景：</span>'
-                      + '<label class="inline-flex items-center mr-6"><input type="radio" name="set-chat-bg" value="yes" ' + (chatBg ? 'checked' : '') + '> <span class="ml-2 text-sm">是</span></label>'
-                      + '<label class="inline-flex items-center"><input type="radio" name="set-chat-bg" value="no" ' + (!chatBg ? 'checked' : '') + '> <span class="ml-2 text-sm">否</span></label></div>'
-                      + '<p class="text-xs text-gray-400 mt-3">聊天背景默认关闭；开启后聊天区域显示图床图片。</p>';
-                } else if (tab === 'sound') {
-                    var snd = settingsData.sound_enabled !== false;
-                    h = '<div class="text-sm font-semibold text-gray-800 mb-2">提示音设置</div>'
-                      + '<p class="text-xs text-gray-400 mb-3">收到新消息时播放一次 QQ 提示音。</p>'
-                      + '<label class="inline-flex items-center mr-6"><input type="radio" name="set-sound" value="yes" ' + (snd ? 'checked' : '') + '> <span class="ml-2 text-sm">开启</span></label>'
-                      + '<label class="inline-flex items-center mr-6"><input type="radio" name="set-sound" value="no" ' + (!snd ? 'checked' : '') + '> <span class="ml-2 text-sm">关闭</span></label>'
-                      + '<button type="button" class="px-3 py-1.5 text-sm rounded-md border border-gray-300 text-gray-600 hover:bg-gray-50" onclick="testNotifySound()">试听</button>';
-                } else if (tab === 'color') {
-                    var dark = settingsData.theme === 'dark';
-                    var auto = !!settingsData.theme_auto;
-                    h = '<div class="text-sm font-semibold text-gray-800 mb-3">颜色设置</div>'
-                      + '<div class="mb-4"><span class="text-sm mr-4">主题：</span>'
-                      + '<label class="inline-flex items-center mr-6"><input type="radio" name="set-theme" value="light" ' + (!dark ? 'checked' : '') + '> <span class="ml-2 text-sm">白</span></label>'
-                      + '<label class="inline-flex items-center"><input type="radio" name="set-theme" value="dark" ' + (dark ? 'checked' : '') + '> <span class="ml-2 text-sm">黑</span></label></div>'
-                      + '<label class="inline-flex items-center mb-3"><input type="checkbox" id="set-theme-auto" ' + (auto ? 'checked' : '') + '> <span class="ml-2 text-sm">自定义切换时间段</span></label>'
-                      + '<div class="flex items-center gap-3 ' + (auto ? '' : 'opacity-50') + '" id="set-theme-range">'
-                      + '<span class="text-sm">黑色时间段</span>'
-                      + '<input type="time" id="set-dark-start" value="' + escapeAttr(settingsData.dark_start || '20:00') + '" ' + (auto ? '' : 'disabled') + ' class="border border-gray-300 rounded-md px-2 py-1 text-sm">'
-                      + '<span class="text-sm">至</span>'
-                      + '<input type="time" id="set-dark-end" value="' + escapeAttr(settingsData.dark_end || '07:00') + '" ' + (auto ? '' : 'disabled') + ' class="border border-gray-300 rounded-md px-2 py-1 text-sm">'
-                      + '</div>'
-                      + '<p class="text-xs text-gray-400 mt-3">启用后，黑色时间段内自动使用黑色主题，其余时间为白色主题；未启用则手动选择。</p>';
-                } else {
-                    h = '<div class="text-lg font-bold text-gray-800 mb-3">关于 QQ Web Chat</div>'
-                      + '<div class="text-sm text-gray-600 space-y-2">'
-                      + '<p>Copyright © 2026 LJY2231 · 保留所有权</p>'
-                      + '<p>基于 Web + WS 技术架构</p>'
-                      + '</div>';
-                }
-                el.innerHTML = h;
-                document.getElementById('settings-save').disabled = false;
-                if (tab === 'color') {
-                    var autoEl = document.getElementById('set-theme-auto');
-                    if (autoEl) {
-                        autoEl.onchange = function() {
-                            var range = document.getElementById('set-theme-range');
-                            var ds = document.getElementById('set-dark-start');
-                            var de = document.getElementById('set-dark-end');
-                            if (this.checked) {
-                                range.classList.remove('opacity-50'); ds.disabled = false; de.disabled = false;
-                            } else {
-                                range.classList.add('opacity-50'); ds.disabled = true; de.disabled = true;
-                            }
-                        };
-                    }
-                }
-            }
-            function collectSettingsTab() {
-                if (!settingsData) return;
-                if (settingsTab === 'whitelist') {
-                    var a = document.getElementById('set-whitelist'); if (a) settingsData.whitelist = a.value.replace(/；/g, ';').split(';').map(function(id) { return id.trim(); }).filter(Boolean);
-                } else if (settingsTab === 'blacklist') {
-                    var b = document.getElementById('set-blacklist'); if (b) settingsData.blacklist = b.value.replace(/；/g, ';').split(';').map(function(id) { return id.trim(); }).filter(Boolean);
-                } else if (settingsTab === 'background') {
-                    var r = document.querySelector('input[name="set-bg"]:checked');
-                    if (r) settingsData.use_image_host = (r.value === 'yes');
-                    var cb = document.querySelector('input[name="set-chat-bg"]:checked');
-                    if (cb) settingsData.chat_background = (cb.value === 'yes');
-                } else if (settingsTab === 'sound') {
-                    var sr = document.querySelector('input[name="set-sound"]:checked');
-                    if (sr) settingsData.sound_enabled = (sr.value === 'yes');
-                } else if (settingsTab === 'color') {
-                    var t = document.querySelector('input[name="set-theme"]:checked');
-                    if (t) settingsData.theme = t.value;
-                    var auto = document.getElementById('set-theme-auto'); if (auto) settingsData.theme_auto = auto.checked;
-                    var s1 = document.getElementById('set-dark-start'); if (s1) settingsData.dark_start = s1.value;
-                    var e1 = document.getElementById('set-dark-end'); if (e1) settingsData.dark_end = e1.value;
-                }
-            }
-            function saveSettings() {
-                collectSettingsTab();
-                if (!settingsData) return;
-                var payload = {
-                    token: authToken,
-                    whitelist: settingsData.whitelist,
-                    blacklist: settingsData.blacklist,
-                    use_image_host: settingsData.use_image_host !== false,
-                    theme: settingsData.theme || 'light',
-                    theme_auto: !!settingsData.theme_auto,
-                    dark_start: settingsData.dark_start || '20:00',
-                    dark_end: settingsData.dark_end || '07:00',
-                    chat_background: !!settingsData.chat_background,
-                    sound_enabled: settingsData.sound_enabled !== false
-                };
-                var x = new XMLHttpRequest();
-                x.open('POST', '/api/settings', true);
-                x.setRequestHeader('Content-Type', 'application/json');
-                x.onreadystatechange = function() {
-                    if (x.readyState !== 4) return;
-                    if (authToken !== payload.token) return;
-                    if (x.status === 200) {
-                        var d;
-                        try {
-                            d = JSON.parse(x.responseText);
-                            if (!d.ok || !d.settings) throw new Error('Invalid settings');
-                        } catch (e) { showToast('保存失败：服务器返回数据无效'); return; }
-                        savedSettings = d.settings;
-                        if (uiSettingsRequest) {
-                            var pendingUi = uiSettingsRequest;
-                            uiSettingsRequest = null;
-                            pendingUi.abort();
-                        }
-                        applyUiCfg(savedSettings);
-                        showToast('设置已保存');
-                        closeSettings();
-                    } else {
-                        showToast('保存失败');
-                    }
-                };
-                x.timeout = 8000;
-                x.send(JSON.stringify(payload));
-            }
-</script>
-
-        <div id="settings-modal" class="fixed inset-0 z-[10000] hidden">
-            <div class="absolute inset-0 bg-black/40" id="settings-mask"></div>
-            <div class="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-white rounded-2xl shadow-2xl w-[92vw] max-w-[720px] h-[70vh] flex overflow-hidden border border-gray-200 settings-panel">
-                <div class="w-40 bg-gray-50 border-r border-gray-200 p-2 shrink-0">
-                    <button type="button" class="set-tab w-full text-left px-3 py-2 rounded-lg text-sm mb-1" data-tab="whitelist" onclick="switchSettingsTab('whitelist')">白名单设置</button>
-                    <button type="button" class="set-tab w-full text-left px-3 py-2 rounded-lg text-sm mb-1" data-tab="blacklist" onclick="switchSettingsTab('blacklist')">黑名单设置</button>
-                    <button type="button" class="set-tab w-full text-left px-3 py-2 rounded-lg text-sm mb-1" data-tab="background" onclick="switchSettingsTab('background')">背景设置</button>
-                    <button type="button" class="set-tab w-full text-left px-3 py-2 rounded-lg text-sm mb-1" data-tab="color" onclick="switchSettingsTab('color')">颜色设置</button>
-                    <button type="button" class="set-tab w-full text-left px-3 py-2 rounded-lg text-sm mb-1" data-tab="sound" onclick="switchSettingsTab('sound')">提示音设置</button>
-                    <button type="button" class="set-tab w-full text-left px-3 py-2 rounded-lg text-sm mb-1" data-tab="about" onclick="switchSettingsTab('about')">关于</button>
-                </div>
-                <div class="flex-1 flex flex-col min-w-0">
-                    <div id="settings-body" class="flex-1 overflow-y-auto p-5"></div>
-                    <div class="border-t border-gray-200 px-4 py-3 flex justify-end gap-2 shrink-0">
-                        <button type="button" id="settings-cancel" class="px-4 py-1.5 text-sm rounded-md border border-gray-300 text-gray-600 hover:bg-gray-50">取消</button>
-                        <button type="button" id="settings-save" class="px-4 py-1.5 text-sm rounded-md bg-blue-500 text-white hover:bg-blue-600">保存</button>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    return web.Response(text=html, content_type='text/html', charset='utf-8')
+    return web.Response(text=(TEMPLATE_DIR / 'main.html').read_text(encoding='utf-8'), content_type='text/html', charset='utf-8')
 
 async def web_nr_handler(request):
-    html = """<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>QQ Web Chat NR</title>
-<style>
-html,body{height:100%;margin:0;padding:0;}
-body{font-family:Arial,"Microsoft YaHei",sans-serif;font-size:14px;color:#333;background:#f2f3f5;overflow:hidden;}
-#login{position:fixed;left:0;top:0;right:0;bottom:0;background:#f2f3f5;z-index:100;padding:40px 16px;}
-#login .box{max-width:360px;margin:0 auto;background:#fff;border-radius:8px;padding:24px;box-shadow:0 2px 10px rgba(0,0,0,.1);}
-#login h2{margin:0 0 16px;font-size:20px;}
-#login input{width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;font-size:16px;}
-#login button{margin-top:12px;width:100%;padding:11px;border:0;border-radius:6px;background:#3b82f6;color:#fff;font-size:16px;}
-#login .err{color:#e5484d;margin-top:10px;font-size:13px;min-height:18px;}
-#app{display:none;height:100%;}
-#sidebar{position:absolute;left:0;top:0;bottom:0;width:230px;background:#fff;border-right:1px solid #e5e5e5;overflow-y:auto;}
-#status{height:40px;line-height:40px;padding:0 12px;font-size:12px;color:#666;border-bottom:1px solid #eee;background:#fafafa;overflow:hidden;white-space:nowrap;}
-#contacts{padding:0;}
-.contact{padding:10px;border-bottom:1px solid #f0f0f0;cursor:pointer;overflow:hidden;}
-.contact.active{background:#e8f0fe;}
-.contact img{float:left;width:38px;height:38px;border-radius:50%;margin-right:8px;background:#ddd;}
-.contact .cinfo{overflow:hidden;}
-.contact .cname{font-weight:bold;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.contact .cid{font-size:11px;color:#999;}
-#chat{position:absolute;left:230px;right:0;top:0;bottom:0;}
-#chatHeader{height:40px;line-height:40px;padding:0 12px;background:#fff;border-bottom:1px solid #e5e5e5;font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-#backBtn{display:none;height:40px;border:0;background:transparent;font-size:20px;color:#3b82f6;margin-right:2px;padding:0 6px;float:left;}
-#messages{position:absolute;top:40px;bottom:48px;left:0;right:0;overflow-y:auto;padding:10px;}
-#composer{position:absolute;left:0;right:0;bottom:0;height:48px;background:#fff;border-top:1px solid #e5e5e5;padding:6px 8px;}
-#composer table{width:100%;border-collapse:collapse;}
-#composer td{vertical-align:middle;padding:0;}
-#composer td.cbtn{width:46px;}
-#composer td.csend{width:54px;}
-#composer td.cbtn button{width:42px;}
-#composer td.csend button{width:50px;}
-#composer input[type=text]{width:100%;height:32px;padding:0 6px;border:1px solid #ccc;border-radius:4px;font-size:14px;box-sizing:border-box;-webkit-box-sizing:border-box;}
-#composer button{height:32px;padding:0;border:0;border-radius:4px;background:#3b82f6;color:#fff;font-size:13px;}
-#composer .pick{background:#eef2f7;color:#333;border:1px solid #dde3ea;}
-.msg{margin:8px 0;overflow:hidden;}
-.msg .meta{font-size:11px;color:#999;margin-bottom:2px;}
-.msg .bubble{display:inline-block;max-width:75%;padding:7px 10px;border-radius:8px;background:#fff;border:1px solid #e3e3e3;text-align:left;word-break:break-all;white-space:pre-wrap;}
-.msg.self{text-align:right;}
-.msg.self .bubble{background:#3b82f6;border-color:#3b82f6;color:#fff;}
-.msg img{max-width:100%;border-radius:4px;display:block;}
-.msg .filelink{color:inherit;text-decoration:underline;}
-.msg .recall{display:inline-block;font-size:11px;color:#999;margin-top:2px;cursor:pointer;}
-.msg.recalled{text-align:center;}
-.msg.recalled .bubble{background:#e5e5e5;border:0;color:#888;font-size:12px;border-radius:10px;}
-@media (max-width:620px){
-  #sidebar{width:100%;}
-  #chat{left:100%;}
-  #app.chat-open #sidebar{display:none;}
-  #backBtn{display:inline-block;}
-  #app.chat-open #chat{left:0;}
-}
-</style>
-</head>
-<body>
-<div id="login">
-  <div class="box">
-    <h2>安全验证</h2>
-    <input id="pwd" type="password" placeholder="请输入访问密码">
-    <button type="button" id="loginBtn">进入聊天</button>
-    <div class="err" id="loginErr"></div>
-  </div>
-</div>
-<div id="app">
-  <div id="sidebar">
-    <div id="status">等待连接...</div>
-    <div id="contacts"></div>
-  </div>
-  <div id="chat">
-    <div id="chatHeader"><button type="button" id="backBtn">‹</button><span id="chatTitle">请选择联系人</span></div>
-    <div id="messages"></div>
-    <div id="composer">
-      <table cellpadding="0" cellspacing="0" border="0"><tr>
-        <td class="cbtn"><button type="button" class="pick" id="pickImg">图片</button></td>
-        <td class="cbtn"><button type="button" class="pick" id="pickFile">文件</button></td>
-        <td class="cinput"><input type="text" id="msgInput" placeholder="输入消息..."></td>
-        <td class="csend"><button type="button" id="sendBtn">发送</button></td>
-      </tr></table>
-      <input type="file" id="imgInput" accept="image/*" style="display:none">
-      <input type="file" id="fileInput" style="display:none">
-    </div>
-  </div>
-</div>
-<script>
-var token=null, ws=null, myQQ=null, contacts={}, currentId=null, currentType=null, pendingFile=null;
-
-function $(id){ return document.getElementById(id); }
-function esc(s){ if(s===null||s===undefined) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-function setStatus(t){ $('status').innerHTML = esc(t); }
-
-function postJSON(url, obj, cb){
-  var x = new XMLHttpRequest();
-  x.open('POST', url, true);
-  x.setRequestHeader('Content-Type','application/json');
-  x.onreadystatechange = function(){ if(x.readyState===4){ cb(x.status, x.responseText); } };
-  x.send(JSON.stringify(obj));
-}
-
-function doLogin(){
-  var pwd = $('pwd').value;
-  $('loginErr').innerHTML = '';
-  if(!pwd){ $('loginErr').innerHTML='请输入密码'; return; }
-  postJSON('/api/login', {password:pwd}, function(status, text){
-    if(status===200){
-      var d = JSON.parse(text);
-      token = d.token;
-      try{ localStorage.setItem('webchat_token', token); }catch(e){}
-      $('login').style.display='none';
-      $('app').style.display='block';
-      connect();
-    } else {
-      $('loginErr').innerHTML='密码错误，请重试';
-    }
-  });
-}
-
-function connect(){
-  var scheme = location.protocol==='https:' ? 'wss://' : 'ws://';
-  try{
-    ws = new WebSocket(scheme + location.host + '/client_ws?token=' + encodeURIComponent(token));
-  }catch(e){ setStatus('浏览器不支持 WebSocket'); return; }
-  ws.onopen = function(){ setStatus('已连接'); if(currentId) ws.send(JSON.stringify({type:'get_history', target_id:currentId})); };
-  ws.onmessage = function(ev){ handle(JSON.parse(ev.data)); };
-  ws.onclose = function(ev){
-    if(ev.code===1008){
-      try{ localStorage.removeItem('webchat_token'); }catch(e){}
-      token=null; $('app').style.display='none'; $('login').style.display='block';
-      $('loginErr').innerHTML='登录已过期，请重新输入密码';
-    } else {
-      setStatus('连接断开，3 秒后重连...');
-      setTimeout(function(){ if(token) connect(); }, 3000);
-    }
-  };
-  ws.onerror = function(){};
-}
-
-function handle(d){
-  if(d.type==='status'){
-    myQQ = d.self_id || myQQ;
-    setStatus(d.connected ? 'NapCat已连接，QQ：'+(d.self_id||'') : 'NapCat未连接');
-  } else if(d.type==='contact_add'){
-    addContact(d.contact);
-  } else if(d.type==='message'){
-    if(d.target_id===currentId){ appendMessage(d); }
-  } else if(d.type==='history_data'){
-    if(d.target_id===currentId){
-      $('messages').innerHTML='';
-      var list=d.messages||[];
-      for(var i=0;i<list.length;i++){ appendMessage(list[i], i===list.length-1); }
-    }
-  } else if(d.type==='toast'){
-    alert(d.content);
-  } else if(d.type==='message_recalled'){
-    var el=$('msg-'+d.message_id);
-    if(el){ el.className='msg recalled'; el.innerHTML='<div class="bubble">「'+esc(d.sender_name||'某人')+'」撤回了一条消息</div>'; }
-  } else if(d.type==='clear_history'){
-    if(d.target_id===currentId){ $('messages').innerHTML=''; }
-  }
-}
-
-function addContact(c){
-  contacts[c.id]=c;
-  var el=$('contact-'+c.id);
-  if(!el){
-    el=document.createElement('div');
-    el.className='contact';
-    el.id='contact-'+c.id;
-    el.onclick=(function(id){ return function(){ switchChat(id); }; })(c.id);
-    $('contacts').appendChild(el);
-  }
-  var html='';
-  if(c.avatar){ html += '<img src="'+esc(c.avatar)+'" onerror="this.style.visibility=\\'hidden\\'">'; }
-  html += '<div class="cinfo"><div class="cname">'+esc(c.name)+'</div><div class="cid">ID: '+esc(c.id)+'</div></div>';
-  el.innerHTML=html;
-}
-
-function switchChat(id){
-  var c=contacts[id];
-  if(!c) return;
-  currentId=id; currentType=c.type;
-  $('chatTitle').innerHTML=esc(c.name);
-  $('messages').innerHTML='<div style="color:#999;text-align:center;padding:20px;">加载中...</div>';
-  var all=$('contacts').getElementsByTagName('div');
-  for(var i=0;i<all.length;i++){ if(all[i].className==='contact active') all[i].className='contact'; }
-  var cur=$('contact-'+id); if(cur) cur.className='contact active';
-  if(window.innerWidth<=620 && $('app').className!=='chat-open'){ $('app').className='chat-open'; }
-  if(ws && ws.readyState===1){ ws.send(JSON.stringify({type:'get_history', target_id:id})); }
-}
-
-function isSelfName(name){
-  if(name==='我') return true;
-  return myQQ!==null && String(name)===String(myQQ);
-}
-
-function appendMessage(m, scroll){
-  var self=isSelfName(m.sender_name);
-  var div=document.createElement('div');
-  div.className='msg'+(self?' self':'')+(m.is_recalled?' recalled':'');
-  div.id='msg-'+m.message_id;
-  if(m.is_recalled){
-    div.innerHTML='<div class="bubble">'+esc(m.content)+'</div>';
-    $('messages').appendChild(div);
-    return;
-  }
-  var meta=document.createElement('div');
-  meta.className='meta';
-  meta.appendChild(document.createTextNode((self?(myQQ!==null?String(myQQ):'我'):m.sender_name)+' · '+m.time));
-  div.appendChild(meta);
-
-  var bubble=document.createElement('div');
-  bubble.className='bubble';
-
-  if(m.media_url){
-    var img=document.createElement('img');
-    img.src = m.media_url.indexOf('/files/')===0 ? m.media_url : '/proxy_img?url='+encodeURIComponent(m.media_url);
-    img.onerror=function(){ this.style.display='none'; };
-    bubble.appendChild(img);
-    if(m.content && m.content!=='[图片]'){
-      var t=document.createElement('div'); t.appendChild(document.createTextNode(m.content)); bubble.appendChild(t);
-    }
-  } else if(m.file_name){
-    if(typeof m.file_url==='string' && (/^https?:\\/\\//i.test(m.file_url) || /^\\/files\\/[a-zA-Z0-9_.-]+$/.test(m.file_url))){
-      var a=document.createElement('a');
-      a.className='filelink';
-      a.href = /^https?:\\/\\//i.test(m.file_url) ? ('/download?url='+encodeURIComponent(m.file_url)+'&name='+encodeURIComponent(m.file_name)) : m.file_url;
-      a.target='_blank';
-      a.appendChild(document.createTextNode(m.file_name));
-      bubble.appendChild(a);
-    } else {
-      bubble.appendChild(document.createTextNode(m.file_name));
-    }
-    if(m.file_size){ var s=document.createElement('div'); s.style.fontSize='11px'; s.appendChild(document.createTextNode(formatSize(m.file_size))); bubble.appendChild(s); }
-  } else {
-    bubble.appendChild(document.createTextNode(m.content));
-  }
-
-  div.appendChild(bubble);
-
-  if(self && m.message_id){
-    var r=document.createElement('div');
-    r.className='recall';
-    r.appendChild(document.createTextNode('撤回'));
-    r.onclick=(function(mid){ return function(){ if(confirm('撤回这条消息？')) recallMsg(mid); }; })(m.message_id);
-    div.appendChild(r);
-  }
-
-  $('messages').appendChild(div);
-  if(scroll!==false){ $('messages').scrollTop=$('messages').scrollHeight; }
-}
-
-function formatSize(n){
-  n=Number(n)||0;
-  if(n<1024) return n+' B';
-  if(n<1024*1024) return (n/1024).toFixed(1)+' KB';
-  return (n/1024/1024).toFixed(2)+' MB';
-}
-
-function recallMsg(id){
-  if(ws && ws.readyState===1){ ws.send(JSON.stringify({type:'recall_message', target_id:currentId, message_id:id})); }
-}
-
-function sendMsg(){
-  if(!currentId){ alert('请先选择联系人'); return; }
-  if(!ws || ws.readyState!==1){ alert('连接已断开'); return; }
-  var text=$('msgInput').value;
-  if(!text && !pendingFile) return;
-  ws.send(JSON.stringify({
-    type:'send_message',
-    target_id:currentId,
-    msg_type:currentType,
-    content:text,
-    quote:null,
-    file_local_path: pendingFile ? pendingFile.local_path : null,
-    file_orig_name: pendingFile ? pendingFile.name : null,
-    file_is_image: pendingFile ? pendingFile.is_image : false
-  }));
-  $('msgInput').value='';
-  pendingFile=null;
-  setStatus('已发送');
-}
-
-function uploadFile(file, isImage){
-  if(!file) return;
-  if(file.size > 50*1024*1024){ alert('文件过大，限制 50MB'); return; }
-  setStatus('上传中：'+file.name);
-  var fd=new FormData();
-  fd.append(isImage?'image':'file', file);
-  var x=new XMLHttpRequest();
-  x.open('POST','/api/upload',true);
-  x.onreadystatechange=function(){
-    if(x.readyState===4){
-      if(x.status===200){
-        var d=JSON.parse(x.responseText);
-        pendingFile={name:file.name, local_path:d.local_path, is_image:isImage};
-        setStatus('已选择：'+file.name);
-      } else {
-        setStatus('上传失败：'+x.status);
-        alert('上传失败，HTTP '+x.status);
-      }
-    }
-  };
-  x.send(fd);
-}
-
-$('backBtn').onclick=function(){ $('app').className=''; };
-$('loginBtn').onclick=doLogin;
-$('pwd').onkeydown=function(e){ if((e.keyCode||e.which)===13) doLogin(); };
-$('sendBtn').onclick=sendMsg;
-$('msgInput').onkeydown=function(e){ if((e.keyCode||e.which)===13) sendMsg(); };
-$('pickImg').onclick=function(){ $('imgInput').click(); };
-$('pickFile').onclick=function(){ $('fileInput').click(); };
-$('imgInput').onchange=function(){ uploadFile(this.files[0], true); };
-$('fileInput').onchange=function(){ uploadFile(this.files[0], false); };
-
-try{
-  var saved=localStorage.getItem('webchat_token');
-  if(saved){ token=saved; $('login').style.display='none'; $('app').style.display='block'; var restore=new XMLHttpRequest(); restore.open('POST','/api/restore',true); restore.setRequestHeader('Content-Type','application/json'); restore.onreadystatechange=function(){if(restore.readyState===4) connect();}; restore.send(JSON.stringify({token:token})); }
-}catch(e){}
-</script>
-</body>
-</html>"""
-    return web.Response(text=html, content_type='text/html', charset='utf-8')
+    return web.Response(text=(TEMPLATE_DIR / 'nr.html').read_text(encoding='utf-8'), content_type='text/html', charset='utf-8')
 
 async def files_handler(request):
     name = request.match_info['name']
@@ -3224,7 +1320,7 @@ async def files_handler(request):
         f = os.fdopen(fd, 'rb')
         info = os.fstat(fd)
         size = info.st_size
-        if not stat.S_ISREG(info.st_mode) or size > MAX_TRANSFER:
+        if not stat.S_ISREG(info.st_mode) or size > MAX_TRANSFER or info.st_mtime < time.time() - UPLOAD_TTL:
             f.close()
             raise web.HTTPNotFound()
     except OSError:
@@ -3240,7 +1336,7 @@ async def files_handler(request):
         await response.prepare(request)
         remaining = size
         while remaining:
-            chunk = await asyncio.to_thread(f.read, min(65536, remaining))
+            chunk = await io_safely(f.read, min(65536, remaining))
             if not chunk:
                 break
             await response.write(chunk)
@@ -3250,23 +1346,112 @@ async def files_handler(request):
     finally:
         f.close()
 
-async def main():
-    if not WEB_PASSWORD or not EXPECTED_TOKEN:
-        raise RuntimeError("请设置 WEB_PASSWORD 和 NAPCAT_ACCESS_TOKEN")
-    if not PUBLIC_BASE_URL.startswith(("http://", "https://")):
-        raise RuntimeError("请将 PUBLIC_BASE_URL 设置为服务的公网 HTTP(S) 地址")
-    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
-    init_storage()
-    load_data()
-    load_settings()
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+async def health_handler(request):
+    # Public process/transport booleans only; no identities, paths, credentials or counts.
+    return web.json_response({'ok': True, 'napcat_connected': state.napcat_connected,
+                              'qq_online': state.qq_online})
 
-    app = web.Application(middlewares=[error_middleware], client_max_size=100 * 1024 * 1024)
+
+async def ready_handler(request):
+    # Readiness means durable local service ready, not that the external QQ account is online.
+    return web.json_response({'ready': ready and not shutdown_event.is_set()},
+                             status=200 if ready and not shutdown_event.is_set() else 503)
+
+
+async def storage_maintenance():
+    while True:
+        await store.call('maintenance')
+        await asyncio.sleep(3600)
+
+
+async def recover_pending_outbound():
+    # Replay only explicitly unpublished local results across pending/partial/unknown.
+    # Cleared published messages have no marker and therefore cannot resurrect.
+    # This NEVER replays an external QQ operation.
+    after = None
+    while True:
+        records = await store.call('pending_outbound', limit=100, after=after)
+        if not records:
+            break
+        for record in records:
+            for part in record['result'].get('parts', []):
+                if part.get('publication_pending') is True:
+                    await store.call('publish_outbound_part', record['request_id'], part['index'])
+            after = record['request_id']
+    await store.call('recover_outbound')
+
+
+async def shutdown_transports(app):
+    global ready
+    ready = False
+    shutdown_event.set()
+    sockets = list(state.clients)
+    if state.napcat_ws is not None:
+        fail_pending_for(state.napcat_ws)
+        sockets.append(state.napcat_ws)
+    try:
+        async with asyncio.timeout(3):
+            await asyncio.gather(*(ws.close(code=1001, message=b'server shutdown') for ws in sockets), return_exceptions=True)
+    except TimeoutError:
+        pass
+
+
+async def application_lifecycle(app):
+    global store, ready, media_queue
+    shutdown_event.clear()
+    inbox_available.clear()
+    media_queue = asyncio.Queue(maxsize=128)
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(UPLOAD_DIR, mode=0o700, exist_ok=True)
+    attachment_budget.directory = Path(UPLOAD_DIR)
+    store = await AsyncStore.open(DB_FILE, legacy_data_path=DATA_FILE,
+                                 legacy_settings_path=SETTINGS_FILE, defaults=DEFAULT_SETTINGS)
+    try:
+        state.contacts = {c['id']: c for c in await store.call('list_contacts')}
+        settings.update((await store.call('get_settings'))['settings'])
+        await recover_pending_outbound()
+        spawn(storage_maintenance())
+        spawn(inbox_worker())
+        spawn(media_worker())
+        spawn(media_worker())
+        spawn(cleanup_old_files())
+        spawn(bridge_cleanup())
+        inbox_available.set()
+        ready = True
+        yield
+    finally:
+        await shutdown_transports(app)
+        tasks = list(background_tasks)
+        for task in tasks:
+            task.cancel()
+        try:
+            async with asyncio.timeout(DRAIN_TIMEOUT):
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except TimeoutError:
+            logger.warning('background task shutdown deadline reached')
+        await store.close()
+        store = None
+        state.napcat_ws = None
+        state.napcat_connected = state.qq_online = False
+        state.self_id = None
+        state.clients.clear()
+        client_owners.clear()
+        bridge_sessions.clear()
+        upload_bindings.clear()
+        client_senders.clear()
+        outbound_tasks.clear()
+
+
+def create_app():
+    app = web.Application(middlewares=[error_middleware, security_middleware(sessions.client_ip)], client_max_size=MAX_TRANSFER + 1024 * 1024)
+    app.on_response_prepare.append(response_headers)
+    app.cleanup_ctx.append(application_lifecycle)
+    app.on_shutdown.append(shutdown_transports)
+    sessions.install(app)
+    app.router.add_get('/healthz', health_handler)
+    app.router.add_get('/readyz', ready_handler)
     app.router.add_get('/ws', napcat_ws_handler)
     app.router.add_get('/', napcat_ws_handler)
-    app.router.add_post('/api/login', login_handler)
-    app.router.add_post('/api/restore', restore_handler)
-    app.router.add_post('/api/logout', logout_handler)
     app.router.add_get('/api/ui_settings', ui_settings_handler)
     app.router.add_get('/api/wallpaper', wallpaper_handler)
     app.router.add_get('/api/settings', settings_handler)
@@ -3281,19 +1466,33 @@ async def main():
     app.router.add_get('/proxy_img', proxy_image_handler)
     app.router.add_get('/download', download_handler)
     app.router.add_get('/files/{name}', files_handler)
-    app.router.add_static('/static', path=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static'))
+    app.router.add_static('/static', path=str(Path(__file__).resolve().parent / 'static'))
+    return app
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 4001)
-    await site.start()
 
-    asyncio.create_task(cleanup_old_files())
-    asyncio.create_task(bridge_cleanup())
-    logger.info("WebChat 启动: http://127.0.0.1:4001/web")
-    await asyncio.Event().wait()
+async def main():
+    load_credentials()
+    if not WEB_PASSWORD or not EXPECTED_TOKEN:
+        raise RuntimeError('请设置 WEB_PASSWORD 和 NAPCAT_ACCESS_TOKEN')
+    if not PUBLIC_BASE_URL.startswith(('http://', 'https://')):
+        raise RuntimeError('请配置 PUBLIC_BASE_URL')
+    runner = web.AppRunner(create_app(), access_log_class=SafeAccessLogger, shutdown_timeout=DRAIN_TIMEOUT)
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, shutdown_event.set)
+    try:
+        await runner.setup()
+        site = web.TCPSite(runner, os.environ.get('CHAT_HOST', '0.0.0.0'), int(os.environ.get('CHAT_PORT', '4001')))
+        await site.start()
+        logger.info('WebChat started')
+        await shutdown_event.wait()
+    finally:
+        await runner.cleanup()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

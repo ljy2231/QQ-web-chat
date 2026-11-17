@@ -14,3 +14,12 @@ chat_data.json*
 settings.json*
 *.bak*
 *.log
+backup*
+*.backup
+*.orig
+*.rej
+node_modules
+.coverage
+htmlcov
+.pytest_cache
+IMPLEMENTATION_CONTRACT.md
