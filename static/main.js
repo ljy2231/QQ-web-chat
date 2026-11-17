@@ -1293,3 +1293,400 @@ let ws = null;
                     x.timeout = 8000; x.send(JSON.stringify(payload));
                 } catch (e) { finishSave(); }
             }
+
+/* ================= 主站图片查看器（原生实现） ================= */
+(function () {
+    if (window.__ivInit) return;
+    window.__ivInit = true;
+
+    const IV_CSS = `
+.iv-overlay{position:fixed;top:0;right:0;bottom:0;left:0;z-index:9999;display:none;align-items:center;justify-content:center;overflow:hidden;background:rgba(8,10,15,0);transition:background .35s ease;}
+.iv-overlay.open{display:flex;background:rgba(8,10,15,.97);}
+.iv-backdrop{position:absolute;top:-80px;right:-80px;bottom:-80px;left:-80px;background-position:center;background-size:cover;filter:blur(46px) saturate(1.3) brightness(.45);transform:scale(1.12);opacity:.5;pointer-events:none;transition:opacity .5s ease;}
+.iv-overlay.closing .iv-backdrop{opacity:0;}
+.iv-stage{position:absolute;top:0;right:0;bottom:0;left:0;display:flex;align-items:center;justify-content:center;overflow:hidden;cursor:grab;}
+.iv-overlay.iv-dragging .iv-stage{cursor:grabbing;}
+.iv-img{max-width:92vw;max-height:calc(100vh - 130px);border-radius:8px;box-shadow:0 30px 90px rgba(0,0,0,.6);transform-origin:center center;transition:transform .34s cubic-bezier(.2,.8,.2,1),opacity .28s ease;will-change:transform;opacity:0;user-select:none;-webkit-user-drag:none;}
+.iv-spinner{position:absolute;top:0;right:0;bottom:0;left:0;margin:auto;width:46px;height:46px;border-radius:50%;border:3px solid rgba(255,255,255,.15);border-top-color:#6ea8ff;animation:iv-spin .8s linear infinite;display:none;}
+@keyframes iv-spin{to{transform:rotate(360deg);}}
+.iv-error{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:none;flex-direction:column;align-items:center;gap:8px;color:#aebcd0;font-size:13px;padding:24px;text-align:center;cursor:pointer;}
+.iv-error b{color:#fff;font-size:15px;font-weight:600;}
+.iv-top{position:absolute;top:18px;left:18px;display:flex;align-items:center;gap:10px;opacity:0;transform:translateY(-8px);transition:opacity .4s ease,transform .4s ease;}
+.iv-overlay.open .iv-top{opacity:1;transform:none;}
+.iv-overlay.closing .iv-top{opacity:0;transform:translateY(-8px);}
+.iv-count{background:rgba(20,24,34,.6);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);color:#e6edf7;font-size:13px;padding:6px 12px;border-radius:999px;border:1px solid rgba(255,255,255,.12);font-variant-numeric:tabular-nums;}
+.iv-title{color:#9aa7ba;font-size:12px;letter-spacing:.2px;text-shadow:0 1px 4px rgba(0,0,0,.5);}
+.iv-bar{position:absolute;left:50%;bottom:22px;transform:translate(-50%,24px);opacity:0;display:flex;align-items:center;gap:4px;padding:8px 10px;border-radius:16px;background:rgba(18,22,32,.72);backdrop-filter:blur(18px) saturate(1.4);-webkit-backdrop-filter:blur(18px) saturate(1.4);border:1px solid rgba(255,255,255,.12);box-shadow:0 18px 50px rgba(0,0,0,.45);transition:transform .45s cubic-bezier(.2,.8,.2,1),opacity .35s ease;}
+.iv-overlay.open .iv-bar{transform:translate(-50%,0);opacity:1;}
+.iv-overlay.closing .iv-bar{transform:translate(-50%,24px);opacity:0;}
+.iv-btn{display:inline-flex;align-items:center;justify-content:center;width:38px;height:34px;border:0;border-radius:9px;background:transparent;color:#d7e0ee;font-size:13px;cursor:pointer;text-decoration:none;transition:background .18s ease,transform .12s ease,color .18s ease;}
+.iv-btn:hover{background:rgba(255,255,255,.12);color:#fff;}
+.iv-btn:active{transform:scale(.92);}
+.iv-btn:disabled{opacity:.3;cursor:default;background:transparent;}
+.iv-btn svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}
+.iv-pct{min-width:46px;text-align:center;color:#9fb0c8;font-size:12px;font-variant-numeric:tabular-nums;}
+.iv-divider{width:1px;height:20px;background:rgba(255,255,255,.14);margin:0 4px;}
+.iv-download{width:auto;padding:0 10px;gap:6px;}
+.iv-hint{position:absolute;left:50%;bottom:82px;transform:translateX(-50%);color:rgba(220,230,245,.6);font-size:12px;letter-spacing:.3px;opacity:0;transition:opacity .6s ease;pointer-events:none;white-space:nowrap;}
+.iv-overlay.open .iv-hint{opacity:1;}
+.iv-hint.iv-hide{opacity:0;}
+@media (max-width:640px){
+  .iv-bar{bottom:14px;gap:0;padding:6px;border-radius:14px;}
+  .iv-btn{width:32px;height:32px;}
+  .iv-hint{display:none;}
+  .iv-img{max-width:96vw;max-height:calc(100vh - 110px);}
+  .iv-top{top:10px;left:10px;}
+}
+`;
+
+    const IV_HTML = `
+<div class="iv-backdrop"></div>
+<div class="iv-stage">
+  <img class="iv-img" alt="" draggable="false">
+  <div class="iv-spinner"></div>
+  <div class="iv-error"><b>图片加载失败</b><span>点击重试</span></div>
+</div>
+<div class="iv-top">
+  <div class="iv-count">1 / 1</div>
+  <div class="iv-title"></div>
+</div>
+<div class="iv-hint">滚轮缩放 · 拖动平移 · 双击放大 · ← → 切换 · Esc 关闭</div>
+<div class="iv-bar">
+  <button class="iv-btn" type="button" data-act="prev" title="上一张 (←)" aria-label="上一张"><svg viewBox="0 0 24 24"><path d="M14.5 5.5 8 12l6.5 6.5"/></svg></button>
+  <button class="iv-btn" type="button" data-act="next" title="下一张 (→)" aria-label="下一张"><svg viewBox="0 0 24 24"><path d="M9.5 5.5 16 12l-6.5 6.5"/></svg></button>
+  <span class="iv-divider"></span>
+  <button class="iv-btn" type="button" data-act="zoomOut" title="缩小 (-)" aria-label="缩小"><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button>
+  <span class="iv-pct">100%</span>
+  <button class="iv-btn" type="button" data-act="zoomIn" title="放大 (+)" aria-label="放大"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+  <button class="iv-btn" type="button" data-act="fit" title="适应屏幕 (0)" aria-label="适应屏幕"><svg viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
+  <button class="iv-btn" type="button" data-act="rotate" title="旋转 (R)" aria-label="旋转"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg></button>
+  <span class="iv-divider"></span>
+  <a class="iv-btn iv-download" data-act="download" download title="下载原图" aria-label="下载原图"><svg viewBox="0 0 24 24"><path d="M12 4v10"/><path d="m7.5 10.5 4.5 4.5 4.5-4.5"/><path d="M5 19h14"/></svg></a>
+  <button class="iv-btn" type="button" data-act="close" title="关闭 (Esc)" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+</div>
+`;
+
+    const state = {open:false, list:[], index:0, scale:1, tx:0, ty:0, rot:0, loading:false, error:false, thumbRect:null, prevOverflow:''};
+    const pointers = new Map();
+    let overlay = null, stage = null, img = null, backdrop = null, countEl = null, pctEl = null, titleEl = null, hintEl = null, spinnerEl = null, errorEl = null, downloadEl = null;
+    let drag = null, pinch = null, hideTimer = null;
+
+    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+    function finalSrc(url) {
+        if (url.indexOf('/files/') === 0 || url.indexOf('/proxy_img?url=') === 0 || url.indexOf('data:') === 0 || url.indexOf('blob:') === 0) return url;
+        return '/proxy_img?url=' + encodeURIComponent(url);
+    }
+    function sameSrc(a, b) {
+        if (!a || !b) return false;
+        if (a === b) return true;
+        try { return decodeURIComponent(a) === decodeURIComponent(b); } catch (ignore) { return false; }
+    }
+    function q(sel) { return overlay && overlay.querySelector ? overlay.querySelector(sel) : null; }
+
+    function apply() {
+        if (!img) return;
+        img.style.transform = 'translate3d(' + state.tx + 'px,' + state.ty + 'px,0) scale(' + state.scale + ') rotate(' + state.rot + 'deg)';
+        if (pctEl) pctEl.textContent = Math.round(state.scale * 100) + '%';
+    }
+
+    function updateChrome() {
+        if (!overlay) return;
+        const item = state.list[state.index] || {url:''};
+        if (countEl) countEl.textContent = (state.index + 1) + ' / ' + state.list.length;
+        if (titleEl) {
+            let text = item.time ? String(item.time) : '';
+            if (img && img.naturalWidth) text += (text ? ' · ' : '') + img.naturalWidth + '×' + img.naturalHeight;
+            titleEl.textContent = text;
+        }
+        const multi = state.list.length > 1;
+        const prev = q('[data-act="prev"]'), next = q('[data-act="next"]');
+        if (prev) prev.disabled = !multi;
+        if (next) next.disabled = !multi;
+        if (backdrop) backdrop.style.backgroundImage = item.url ? 'url(' + JSON.stringify(finalSrc(item.url)) + ')' : '';
+        if (downloadEl && item.url) {
+            const m = /\.([a-z0-9]{2,5})(?:[?#]|$)/i.exec(item.url);
+            downloadEl.href = finalSrc(item.url);
+            downloadEl.setAttribute('download', 'webchat-' + (state.index + 1) + '.' + (m ? m[1].toLowerCase() : 'jpg'));
+        }
+        apply();
+    }
+
+    function loadImage(dir, first) {
+        if (!state.list.length || !img) return;
+        const item = state.list[state.index];
+        state.loading = true; state.error = false;
+        if (spinnerEl) spinnerEl.style.display = 'block';
+        if (errorEl) errorEl.style.display = 'none';
+        img.style.opacity = '0';
+        if (dir) {
+            img.style.transition = 'none';
+            img.style.transform = 'translate3d(' + (dir > 0 ? 36 : -36) + 'px,0,0) scale(.94)';
+        }
+        img.onload = function () {
+            if (!state.open) return;
+            state.loading = false;
+            if (spinnerEl) spinnerEl.style.display = 'none';
+            img.style.transition = '';
+            if (first) animateIn(state.thumbRect);
+            else {
+                state.tx = 0; state.ty = 0; state.scale = 1; state.rot = 0;
+                apply(); img.style.opacity = '1';
+            }
+            updateChrome();
+            preload();
+        };
+        img.onerror = function () {
+            state.loading = false; state.error = true;
+            if (spinnerEl) spinnerEl.style.display = 'none';
+            if (errorEl) errorEl.style.display = 'flex';
+            img.style.opacity = '0';
+        };
+        img.src = finalSrc(item.url);
+    }
+
+    function animateIn(fromRect) {
+        state.tx = 0; state.ty = 0; state.scale = 1; state.rot = 0;
+        const r = img.getBoundingClientRect();
+        if (fromRect && r.width > 4 && r.height > 4) {
+            const dx = (fromRect.left + fromRect.width / 2) - (r.left + r.width / 2);
+            const dy = (fromRect.top + fromRect.height / 2) - (r.top + r.height / 2);
+            const s = clamp(fromRect.width / r.width, 0.15, 1);
+            img.style.transition = 'none';
+            img.style.transform = 'translate3d(' + dx + 'px,' + dy + 'px,0) scale(' + s + ')';
+            img.style.opacity = '.55';
+            void img.offsetWidth;
+            img.style.transition = '';
+            requestAnimationFrame(function () { img.style.opacity = '1'; apply(); });
+        } else {
+            img.style.opacity = '1';
+            apply();
+        }
+    }
+
+    function preload() {
+        const i = state.index + 1, j = state.index - 1;
+        if (i < state.list.length) { const a = new Image(); a.src = finalSrc(state.list[i].url); }
+        if (j >= 0) { const b = new Image(); b.src = finalSrc(state.list[j].url); }
+    }
+
+    function step(delta) {
+        if (state.list.length < 2) return;
+        state.index = (state.index + delta + state.list.length) % state.list.length;
+        state.scale = 1; state.tx = 0; state.ty = 0; state.rot = 0;
+        updateChrome();
+        loadImage(delta, false);
+    }
+
+    function zoomTo(target, cx, cy) {
+        const ns = clamp(target, 0.4, 8);
+        const ratio = ns / state.scale;
+        if (ratio === 1) return;
+        state.tx = cx - (cx - state.tx) * ratio;
+        state.ty = cy - (cy - state.ty) * ratio;
+        state.scale = ns;
+        apply();
+    }
+    function zoomBy(factor) { zoomTo(state.scale * factor, 0, 0); }
+    function resetView() { state.scale = 1; state.tx = 0; state.ty = 0; state.rot = 0; apply(); }
+
+    function openViewer(list, index, thumbRect) {
+        state.list = list; state.index = index;
+        state.open = true; state.scale = 1; state.tx = 0; state.ty = 0; state.rot = 0;
+        state.thumbRect = thumbRect || null;
+        state.prevOverflow = document.body.style.overflow || '';
+        document.body.style.overflow = 'hidden';
+        overlay.style.display = 'flex';
+        overlay.setAttribute('aria-hidden', 'false');
+        overlay.classList.remove('closing');
+        overlay.classList.add('open');
+        clearTimeout(hideTimer);
+        if (hintEl) hintEl.classList.remove('iv-hide');
+        hideTimer = setTimeout(function () { if (hintEl && state.open) hintEl.classList.add('iv-hide'); }, 3200);
+        updateChrome();
+        loadImage(0, true);
+    }
+
+    function closeViewer() {
+        if (!state.open) return;
+        state.open = false;
+        clearTimeout(hideTimer);
+        overlay.classList.add('closing');
+        overlay.classList.remove('open');
+        overlay.style.background = 'rgba(8,10,15,0)';
+        const thumb = state.thumbRect;
+        if (thumb && img) {
+            const r = img.getBoundingClientRect();
+            if (r.width > 4) {
+                const dx = (thumb.left + thumb.width / 2) - (r.left + r.width / 2);
+                const dy = (thumb.top + thumb.height / 2) - (r.top + r.height / 2);
+                const s = clamp(thumb.width / r.width, 0.1, 1);
+                img.style.transform = 'translate3d(' + dx + 'px,' + dy + 'px,0) scale(' + s + ')';
+                img.style.opacity = '.35';
+            } else img.style.opacity = '0';
+        } else if (img) img.style.opacity = '0';
+        setTimeout(function () {
+            overlay.style.display = 'none';
+            overlay.setAttribute('aria-hidden', 'true');
+            overlay.classList.remove('closing');
+            overlay.style.background = '';
+            if (img) { img.style.transform = ''; img.style.opacity = ''; img.removeAttribute('src'); }
+            document.body.style.overflow = state.prevOverflow || '';
+        }, 260);
+        state.thumbRect = null;
+    }
+
+    function onWheel(e) {
+        if (!state.open || !img) return;
+        e.preventDefault();
+        const r = img.getBoundingClientRect();
+        const cx = e.clientX - (r.left + r.width / 2);
+        const cy = e.clientY - (r.top + r.height / 2);
+        zoomTo(state.scale * Math.exp(-e.deltaY * 0.0018), cx, cy);
+    }
+
+    function onPointerDown(e) {
+        if (!state.open || !img) return;
+        const target = e.target;
+        if (target !== img && target !== stage) return;
+        pointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
+        if (pointers.size === 1) {
+            drag = {x:e.clientX, y:e.clientY, tx:state.tx, ty:state.ty};
+            overlay.classList.add('iv-dragging');
+            try { img.setPointerCapture(e.pointerId); } catch (ignore) {}
+        } else if (pointers.size === 2) {
+            drag = null;
+            const pts = [];
+            pointers.forEach(function (p) { pts.push(p); });
+            pinch = {dist:Math.max(1, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y)), scale:state.scale};
+        }
+    }
+
+    function onPointerMove(e) {
+        if (!state.open) return;
+        if (pointers.has(e.pointerId)) pointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
+        if (pinch && pointers.size === 2) {
+            const pts = [];
+            pointers.forEach(function (p) { pts.push(p); });
+            const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+            state.scale = clamp(pinch.scale * dist / pinch.dist, 0.4, 8);
+            apply();
+            return;
+        }
+        if (!drag) return;
+        state.tx = drag.tx + (e.clientX - drag.x);
+        state.ty = drag.ty + (e.clientY - drag.y);
+        apply();
+    }
+
+    function onPointerUp(e) {
+        pointers.delete(e.pointerId);
+        if (pointers.size < 2) pinch = null;
+        if (pointers.size === 0) { drag = null; if (overlay) overlay.classList.remove('iv-dragging'); }
+    }
+
+    function onDblClick(e) {
+        if (!state.open || e.target !== img) return;
+        e.preventDefault();
+        if (state.scale > 1.05) { resetView(); return; }
+        const r = img.getBoundingClientRect();
+        zoomTo(2.6, e.clientX - (r.left + r.width / 2), e.clientY - (r.top + r.height / 2));
+    }
+
+    function onClick(e) {
+        if (!state.open) return;
+        let node = e.target;
+        while (node && node !== overlay && !(node.getAttribute && node.getAttribute('data-act'))) node = node.parentNode;
+        if (node && node !== overlay) {
+            const act = node.getAttribute('data-act');
+            if (act === 'prev') { step(-1); return; }
+            if (act === 'next') { step(1); return; }
+            if (act === 'zoomIn') { zoomBy(1.35); return; }
+            if (act === 'zoomOut') { zoomBy(1 / 1.35); return; }
+            if (act === 'fit') { resetView(); return; }
+            if (act === 'rotate') { state.rot = (state.rot + 90) % 360; apply(); return; }
+            if (act === 'close') { closeViewer(); return; }
+            if (act === 'download') return;
+        }
+        if (errorEl && (e.target === errorEl || (errorEl.contains && errorEl.contains(e.target)))) { loadImage(0, false); return; }
+        if (e.target === img) return;
+        if (e.target === overlay || e.target === stage) closeViewer();
+    }
+
+    function onKey(e) {
+        if (!state.open) return;
+        const key = e.key;
+        if (key === 'Escape') { e.preventDefault(); closeViewer(); }
+        else if (key === 'ArrowLeft') { e.preventDefault(); step(-1); }
+        else if (key === 'ArrowRight') { e.preventDefault(); step(1); }
+        else if (key === '+' || key === '=') { e.preventDefault(); zoomBy(1.3); }
+        else if (key === '-') { e.preventDefault(); zoomBy(1 / 1.3); }
+        else if (key === '0') { e.preventDefault(); resetView(); }
+        else if (key && key.toLowerCase() === 'r') { e.preventDefault(); state.rot = (state.rot + 90) % 360; apply(); }
+    }
+
+    function collectImages() {
+        const list = [];
+        if (!currentTargetId) return list;
+        const messages = store.list(currentTargetId) || [];
+        messages.forEach(function (m) {
+            ChatCore.segments(m).forEach(function (s) {
+                if (!s || s.type !== 'image') return;
+                const d = s.data || s;
+                const u = d.url || d.media_url || d.file;
+                if (u) list.push({url:u, id:m.message_id, time:m.time || ''});
+            });
+        });
+        return list;
+    }
+
+    function findRow(el) {
+        let node = el;
+        while (node && node !== messageArea) {
+            if (node.id && String(node.id).indexOf('msg-') === 0) return node;
+            node = node.parentNode;
+        }
+        return null;
+    }
+
+    function onMessageClick(e) {
+        const target = e.target;
+        if (!target || String(target.tagName || '').toUpperCase() !== 'IMG') return;
+        const src = target.getAttribute('src') || target.src || '';
+        if (!src) return;
+        const row = findRow(target);
+        const msgId = row ? String(row.id).slice(4) : '';
+        const list = collectImages();
+        let index = -1;
+        if (msgId) index = list.findIndex(function (it) { return it.id === msgId && sameSrc(finalSrc(it.url), src); });
+        if (index < 0) index = list.findIndex(function (it) { return sameSrc(finalSrc(it.url), src); });
+        if (index < 0) { list.unshift({url:src, id:msgId, time:''}); index = 0; }
+        openViewer(list, index, target.getBoundingClientRect());
+    }
+
+    function init() {
+        const style = document.createElement('style');
+        style.textContent = IV_CSS;
+        (document.head || document.documentElement || document.body).appendChild(style);
+        overlay = document.createElement('div');
+        overlay.id = 'iv-overlay';
+        overlay.className = 'iv-overlay';
+        overlay.setAttribute('aria-hidden', 'true');
+        overlay.innerHTML = IV_HTML;
+        document.body.appendChild(overlay);
+        stage = q('.iv-stage'); img = q('.iv-img'); backdrop = q('.iv-backdrop');
+        countEl = q('.iv-count'); pctEl = q('.iv-pct'); titleEl = q('.iv-title');
+        hintEl = q('.iv-hint'); spinnerEl = q('.iv-spinner'); errorEl = q('.iv-error'); downloadEl = q('.iv-download');
+        overlay.addEventListener('click', onClick, false);
+        overlay.addEventListener('wheel', onWheel, {passive:false});
+        overlay.addEventListener('pointerdown', onPointerDown, false);
+        overlay.addEventListener('pointermove', onPointerMove, false);
+        overlay.addEventListener('pointerup', onPointerUp, false);
+        overlay.addEventListener('pointercancel', onPointerUp, false);
+        overlay.addEventListener('dblclick', onDblClick, false);
+        document.addEventListener('keydown', onKey, false);
+        window.addEventListener('resize', function () { if (state.open) apply(); }, false);
+        messageArea.addEventListener('click', onMessageClick, false);
+    }
+
+    init();
+})();
