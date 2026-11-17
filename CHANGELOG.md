@@ -12,7 +12,7 @@
 
 ### Behavior changes
 
-`= ALL ON/OFF` is administrator-only in private chat and target-scoped. Reply segments no longer bypass the normal private-message prefix. Client IP disclosure defaults off. Old browser bearer sessions expire on upgrade; refresh and log in again. Attachments selected before restart must be uploaded again.
+`= ALL ON/OFF` is administrator-only in private chat and target-scoped. Reply segments no longer bypass the normal private-message prefix. Client IP disclosure defaults on to keep the original 正文/IP/time wire format; set DISCLOSE_CLIENT_IP=false to omit it. Old browser bearer sessions expire on upgrade; refresh and log in again. Attachments selected before restart must be uploaded again.
 
 ### Validation and limits
 

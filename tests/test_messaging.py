@@ -266,12 +266,12 @@ class MessagingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('send_group_msg', [action for action, _ in calls])
             # The original help menu is restored verbatim.
             await self.s.process_inbound(self.incoming(3, content='='))
-            self.assertEqual(calls[-1][1], '【指令菜单】\n= ALL 开启全量转发\n= CLEAR 清空聊天记录\n= REBOOT 重启服务器')
+            self.assertEqual(calls[-1][1], '[QQweb-Chat]\n= ALL 开启全量转发\n= CLEAR 清空聊天记录\n= REBOOT 重启服务器')
             other = self.incoming(4, content='=')
             other['sender']['user_id'] = 13
             other['user_id'] = 13
             await self.s.process_inbound(other)
-            self.assertEqual(calls[-1][1], '【指令菜单】\n= ALL 开启全量转发')
+            self.assertEqual(calls[-1][1], '[QQweb-Chat]\n= ALL 开启全量转发')
             # A lone '=' in a group still gets no reply.
             count = len(calls)
             await self.s.process_inbound(self.incoming(5, kind='group', content='='))
@@ -474,7 +474,8 @@ class MessagingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.event(browser, 'send_result', lambda d: d['request_id'] == 'quote1' and d['status'] == 'confirmed')
         sends = [d for d in self.actions if d['action'] == 'send_private_msg']
         self.assertEqual(sends[-1]['params']['message'][0], {'type': 'reply', 'data': {'id': '9001'}})
-        self.assertNotIn('IP:', json.dumps(sends[-1]))
+        text = next(x for x in sends[-1]['params']['message'] if x['type'] == 'text')['data']['text']
+        self.assertRegex(text, r'^正文:reply\nIP:127\.0\.0\.1\n\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$')
         for request, target in [('other-target', 'group:12'), ('reuse', 'private:12')]:
             await browser.send_json({**payload, 'request_id': request, 'target_id': target})
             await self.event(browser, 'send_result', lambda d: d['request_id'] == request and d['status'] == 'failed')

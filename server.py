@@ -69,7 +69,7 @@ background_tasks = set()
 shutdown_event = asyncio.Event()
 inbox_available = asyncio.Event()
 media_queue = asyncio.Queue(maxsize=128)
-DISCLOSE_CLIENT_IP = os.environ.get('DISCLOSE_CLIENT_IP', '').lower() in ('1', 'true', 'yes')
+DISCLOSE_CLIENT_IP = os.environ.get('DISCLOSE_CLIENT_IP', 'true').lower() not in ('0', 'false', 'no')
 ready = False
 # Upload authority is separate from the public, expiring delivery capability.
 upload_bindings = {}
@@ -909,9 +909,9 @@ async def process_inbound(data):
             return
         admin = current_admin()
         if admin and sender_id == admin:
-            help_text = '【指令菜单】\n= ALL 开启全量转发\n= CLEAR 清空聊天记录\n= REBOOT 重启服务器'
+            help_text = '[QQweb-Chat]\n= ALL 开启全量转发\n= CLEAR 清空聊天记录\n= REBOOT 重启服务器'
         else:
-            help_text = '【指令菜单】\n= ALL 开启全量转发'
+            help_text = '[QQweb-Chat]\n= ALL 开启全量转发'
         await send_qq_api(action, {**params, 'message': help_text})
         return
     if kind == 'private' and not await store.call('get_mode', target):
@@ -1185,11 +1185,14 @@ async def outbound_send(ws, data, client_ip, owner=None):
                 operations.append(([{'type': 'file', 'data': {'file': PUBLIC_BASE_URL + local_url, 'name': name}}],
                                    {'content': '[文件] ' + name, 'file_name': name, 'file_size': size,
                                     'file_url': local_url, 'segments': [file_segment]}, 600.0))
+        time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         content = data.get('content', '')
         if content:
-            text = content
+            # Restore the original wire format: 正文 / IP / time.
+            text = '正文:' + content
             if DISCLOSE_CLIENT_IP:
                 text += '\nIP:' + str(client_ip)
+            text += '\n' + time_str
             payload.append({'type': 'text', 'data': {'text': text}})
         if payload and any(x['type'] != 'reply' for x in payload):
             segments = ([file_segment] if file_segment and file_segment['type'] == 'image' else [])
@@ -1221,7 +1224,7 @@ async def outbound_send(ws, data, client_ip, owner=None):
                        'sender_name': str(state.self_id or '我'), 'sender_id': str(state.self_id or ''),
                        'direction': 'outgoing', 'request_id': request_id,
                        'napcat_message_ids': [str(platform)] if platform is not None else [],
-                       'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                       'time': time_str}
             parts.append({'index': index, 'status': 'confirmed', 'message_id': mid,
                           'platform_ids': message['napcat_message_ids'], 'message': message,
                           'quote_id': quote_id, 'publication_pending': True})
