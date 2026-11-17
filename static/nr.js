@@ -2,13 +2,14 @@
 var session = null, connection = null, myQQ = null, contacts = {}, currentId = null, currentType = null;
 var pendingFile = null, currentXHR = null, quoteMsg = null, store = new ChatCore.Store();
 var composing = false, historyTimer = null, sessionRequest = null, sessionGeneration = 0, logoutGeneration = 0, logoutPending = false;
+var NR_BUILD = 'NR v3';
 var wsToken = null;
 try { wsToken = window.sessionStorage.getItem('nr_ws_token'); } catch (ignore) {}
 function $(id) { return document.getElementById(id); }
 function esc(s) { return String(s === null || s === undefined ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 function notice(text) { $('feedback').textContent = text; }
 function updateStatus() {
-    $('status').textContent = connection ? ChatCore.status(connection) : 'Web：未连接 · NapCat：未知 · QQ：未知';
+    $('status').textContent = (connection ? ChatCore.status(connection) : 'Web：未连接 · NapCat：未知 · QQ：未知') + ' · ' + NR_BUILD + (window.WebSocket ? '' : ' · 不支持WebSocket');
     $('sendBtn').disabled = !currentId || currentId.indexOf('legacy:') === 0 || !connection || connection.state !== 'open' || !connection.napcat || !connection.qq;
 }
 function enterSession() {

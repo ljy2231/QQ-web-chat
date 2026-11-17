@@ -176,7 +176,7 @@
     function Connection(options) {
         this.options = options; this.socket = null; this.timer = null; this.watch = null;
         this.active = false; this.attempt = 0; this.last = 0; this.state = 'closed';
-        this.napcat = null; this.qq = null;
+        this.napcat = null; this.qq = null; this.lastError = '';
     }
     Connection.prototype.publish = function () { this.options.status(this); };
     Connection.prototype.open = function () {
@@ -193,7 +193,10 @@
         var wsURL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/client_ws';
         if (this.options.token) wsURL += '?token=' + encodeURIComponent(this.options.token);
         try { socket = new WebSocket(wsURL); }
-        catch (ignore) { this.retry(); return; }
+        catch (error) {
+            this.lastError = 'WS创建失败:' + ((error && error.message) || '未知');
+            this.retry(); return;
+        }
         this.socket = socket;
         this.last = Date.now();
         this.timer = setTimeout(function () {
@@ -230,7 +233,9 @@
         socket.onclose = function (event) {
             if (that.socket !== socket) return;
             that.socket = null; clearInterval(that.watch); clearTimeout(that.timer); that.timer = null;
-            that.state = 'closed'; that.napcat = false; that.qq = false; that.publish();
+            that.state = 'closed'; that.napcat = false; that.qq = false;
+            if (event && event.code && event.code !== 1000) that.lastError = 'WS关闭:' + event.code;
+            that.publish();
             if (that.options.disconnected) that.options.disconnected();
             if (event.code === 1008 || event.code === 4001) { that.active = false; that.options.expired(); }
             else that.retry();
@@ -255,6 +260,7 @@
     };
     function status(c) {
         return 'Web：' + (c.state === 'open' ? '已连接' : (c.state === 'connecting' ? '连接中' : '断开，重连中')) +
+            (c.lastError ? '（' + c.lastError + '）' : '') +
             ' · NapCat：' + (c.state !== 'open' || c.napcat === null ? '未知' : (c.napcat ? '已连接' : '离线')) +
             ' · QQ：' + (c.state !== 'open' || !c.napcat || c.qq === null ? '未知' : (c.qq ? '在线' : '离线'));
     }
