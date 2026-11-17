@@ -2,7 +2,7 @@
 var session = null, connection = null, myQQ = null, contacts = {}, currentId = null, currentType = null;
 var pendingFile = null, currentXHR = null, quoteMsg = null, store = new ChatCore.Store();
 var composing = false, historyTimer = null, sessionRequest = null, sessionGeneration = 0, logoutGeneration = 0, logoutPending = false;
-var NR_BUILD = 'NR v5';
+var NR_BUILD = 'NR v6';
 var nrView = {open: false, scale: 1, tx: 0, ty: 0}, nrDrag = null, NR_MIN_SCALE = 1, NR_MAX_SCALE = 5, NR_ZOOM_STEP = 1.35;
 var wsToken = null;
 try { wsToken = window.sessionStorage.getItem('nr_ws_token'); } catch (ignore) {}
@@ -84,7 +84,7 @@ function handle(d) {
     } else if (d.type === 'history_data') {
         if (store.history(d) && d.target_id === currentId) {
             clearTimeout(historyTimer); var loading = $('history-loading'); if (loading && loading.parentNode) loading.parentNode.removeChild(loading);
-            renderCurrent();
+            renderCurrent(true);
         }
     } else if (d.type === 'send_result') {
         var item = store.result(d);
@@ -103,7 +103,7 @@ function handle(d) {
             renderCurrent();
         }
     } else if (d.type === 'clear_history') {
-        if (store.clear(d) && d.target_id === currentId) { cancelQuote(); renderCurrent(); }
+        if (store.clear(d) && d.target_id === currentId) { cancelQuote(); $('messages').innerHTML = ''; renderCurrent(); }
     }
 }
 function addContact(c) {
@@ -153,24 +153,87 @@ function requestHistory() {
     if (!connection || !connection.send({type: 'get_history', target_id: target})) { finishHistory('Web 断开，重连后重新加载'); return; }
     historyTimer = setTimeout(function() { if (target === currentId) finishHistory('历史加载超时，请重新选择会话重试'); }, 12000);
 }
-function renderCurrent() {
+function nrNearBottom(area) {
+    if (!area || typeof area.clientHeight !== 'number') return false;
+    return area.scrollHeight - area.scrollTop - area.clientHeight < 80;
+}
+function nrScrollBottom(area) {
+    if (!area) return;
+    area.scrollTop = area.scrollHeight;
+    setTimeout(function () { if (area) area.scrollTop = area.scrollHeight; }, 0);
+    setTimeout(function () { if (area && nrNearBottom(area)) area.scrollTop = area.scrollHeight; }, 300);
+}
+function nrReplaceNode(node, fresh) {
+    var parent = node.parentNode;
+    if (!parent) return;
+    if (parent.replaceChild) { parent.replaceChild(fresh, node); return; }
+    parent.removeChild(node); parent.appendChild(fresh);
+}
+function nrWatchImage(img, area) {
+    var prevLoad = img.onload, prevError = img.onerror;
+    img.__nrSrc = img.getAttribute('src') || img.src;
+    img.onload = function () {
+        if (prevLoad) { try { prevLoad.call(this); } catch (ignore) {} }
+        if (nrNearBottom(area)) nrScrollBottom(area);
+    };
+    img.onerror = function () {
+        if (prevError) { try { prevError.call(this); } catch (ignore) {} }
+        var retries = img.__nrRetry || 0;
+        if (retries < 2 && img.__nrSrc && img.parentNode) {
+            img.__nrRetry = retries + 1;
+            setTimeout(function () {
+                if (!img.parentNode) return;
+                img.style.display = '';
+                img.src = img.__nrSrc + (img.__nrSrc.indexOf('?') >= 0 ? '&' : '?') + 'nr_retry=' + (retries + 1);
+            }, 900 * (retries + 1));
+        } else if (nrNearBottom(area)) nrScrollBottom(area);
+    };
+}
+function nrWatchImages(area) {
+    var imgs = area.getElementsByTagName('img'), i;
+    for (i = 0; i < imgs.length; i++) {
+        if (imgs[i].__nrWatched) continue;
+        imgs[i].__nrWatched = true;
+        nrWatchImage(imgs[i], area);
+    }
+}
+function renderCurrent(force) {
     if (!currentId) return;
-    var area = $('messages'), loading = $('history-loading'); area.innerHTML = '';
-    if (loading) area.appendChild(loading);
+    var area = $('messages'), loading = $('history-loading');
+    var stick = nrNearBottom(area), fromBottom = area.scrollHeight - area.scrollTop;
+    if (force) {
+        area.innerHTML = '';
+        if (loading) area.appendChild(loading);
+    }
     var list = store.list(currentId);
-    for (var i = 0; i < list.length; i++) appendMessage(list[i]);
-    var states = document.createElement('div'); states.id = 'send-states';
+    for (var i = 0; i < list.length; i++) {
+        var m = list[i], node = $('msg-' + m.message_id);
+        if (!node) { appendMessage(m); continue; }
+        var stale = Number(node.getAttribute('data-revision') || 0) < Number(m.revision || 0);
+        var needsRecall = m.is_recalled && String(node.className || '').indexOf('recalled') < 0;
+        if (stale || needsRecall) nrReplaceNode(node, buildMessage(m));
+    }
+    var states = $('send-states');
+    if (states && states.parentNode) states.parentNode.removeChild(states);
+    states = document.createElement('div'); states.id = 'send-states';
     ChatCore.renderOutbox(states, store, currentId, function(item) {
         if (($('msgInput').value || pendingFile || quoteMsg) && !confirm('恢复将替换当前草稿，是否继续？')) return;
         restoreDraft(item.draft); saveDraft();
     });
-    area.appendChild(states); area.scrollTop = area.scrollHeight;
+    area.appendChild(states);
+    nrWatchImages(area);
+    if (stick) nrScrollBottom(area);
+    else if (isFinite(fromBottom)) area.scrollTop = area.scrollHeight - fromBottom;
 }
 function appendMessage(m) {
     if (m.target_id !== currentId || $('msg-' + m.message_id)) return;
+    $('messages').appendChild(buildMessage(m));
+}
+function buildMessage(m) {
     var self = ChatCore.self(m), div = document.createElement('div');
     div.className = 'msg' + (self ? ' self' : '') + (m.is_recalled ? ' recalled' : ''); div.id = 'msg-' + m.message_id;
-    if (m.is_recalled) { div.innerHTML = '<div class="bubble">' + esc(m.content) + '</div>'; $('messages').appendChild(div); return; }
+    div.setAttribute('data-revision', String(m.revision || 0));
+    if (m.is_recalled) { div.innerHTML = '<div class="bubble">' + esc(m.content) + '</div>'; return div; }
     var meta = document.createElement('div'); meta.className = 'meta';
     meta.appendChild(document.createTextNode((self ? (myQQ || '我') : (m.sender_name || m.sender_id || '未知')) + ' · ' + (m.time || ''))); div.appendChild(meta);
     var bubble = document.createElement('div'); bubble.className = 'bubble';
@@ -187,7 +250,7 @@ function appendMessage(m) {
         var recall = document.createElement('button'); recall.className = 'recall'; recall.type = 'button'; recall.textContent = '撤回';
         recall.onclick = function() { if (confirm('撤回这条消息？')) recallMsg(m.message_id); }; actions.appendChild(recall);
     }
-    div.appendChild(actions); $('messages').appendChild(div);
+    div.appendChild(actions); return div;
 }
 function recallMsg(id) { if (!currentId || currentId.indexOf('legacy:') === 0) { notice('归档仅供查看'); return; } if (!connection || !connection.send({type: 'recall_message', target_id: currentId, message_id: id})) notice('Web 断开，撤回未提交'); }
 function sendMsg() {

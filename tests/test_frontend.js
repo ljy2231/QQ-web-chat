@@ -267,4 +267,13 @@ test('NR image viewer opens from a thumbnail, zooms with buttons and closes',()=
  assert.equal(h.run('nrView.tx'),80);assert.equal(h.run('nrView.ty'),50);
  h.nodes['nrViewerClose'].click();assert.equal(h.nodes['nrViewer'].style.display,'none');
 });
+test('NR appends new messages without rebuilding existing nodes',()=>{
+ const h=harness('nr');
+ h.run("currentId='private:100';currentType='private'");
+ h.run("handle({type:'message',target_id:'private:100',message_id:'a',direction:'incoming',content:'one',time:'00:00',revision:1})");
+ const first=h.ctx.document.getElementById('msg-a');
+ h.run("handle({type:'message',target_id:'private:100',message_id:'b',direction:'incoming',content:'two',time:'00:00',revision:2})");
+ assert.equal(h.ctx.document.getElementById('msg-a'),first);
+ assert.ok(h.ctx.document.getElementById('msg-b'));
+});
 console.log('PASS '+count+' synthetic frontend tests (no browser/device assertions)');
