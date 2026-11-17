@@ -2,7 +2,7 @@
 var session = null, connection = null, myQQ = null, contacts = {}, currentId = null, currentType = null;
 var pendingFile = null, currentXHR = null, quoteMsg = null, store = new ChatCore.Store();
 var composing = false, historyTimer = null, sessionRequest = null, sessionGeneration = 0, logoutGeneration = 0, logoutPending = false;
-var NR_BUILD = 'NR v7';
+var NR_BUILD = 'NR v8';
 var nrView = {open: false, scale: 1, tx: 0, ty: 0}, nrDrag = null, NR_MIN_SCALE = 1, NR_MAX_SCALE = 5, NR_ZOOM_STEP = 1.35;
 var nrStick = true;
 var wsToken = null;
@@ -190,7 +190,19 @@ function nrAppendDeferred(bubble, urls) {
         row = document.createElement('div'); row.className = 'nr-late-row';
         label = document.createElement('span'); label.className = 'nr-late-label'; label.textContent = '图片信息';
         btn = document.createElement('button'); btn.type = 'button'; btn.className = 'nr-late-download'; btn.textContent = '下载';
-        btn.onclick = (function (url) { return function () { nrOpenImage(url); }; })(urls[i]);
+        btn.onclick = (function (url, rowEl, labelEl, btnEl, bubbleEl) {
+            return function () {
+                if (btnEl.disabled) return;
+                btnEl.disabled = true; labelEl.textContent = '加载中…';
+                var img = document.createElement('img');
+                img.className = 'nr-late-img'; img.alt = '消息图片';
+                img.style.maxWidth = '100%'; img.style.maxHeight = '240px'; img.style.display = 'block';
+                img.onload = function () { if (rowEl.parentNode) rowEl.parentNode.removeChild(rowEl); if (nrStick) nrScrollBottom($('messages')); };
+                img.onerror = function () { if (img.parentNode) img.parentNode.removeChild(img); btnEl.disabled = false; labelEl.textContent = '图片信息（加载失败，可重试）'; };
+                bubbleEl.appendChild(img);
+                img.src = url.indexOf('/files/') === 0 ? url : '/proxy_img?url=' + encodeURIComponent(url);
+            };
+        })(urls[i], row, label, btn, bubble);
         row.appendChild(label); row.appendChild(btn); box.appendChild(row);
     }
     bubble.appendChild(box);

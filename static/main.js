@@ -785,7 +785,27 @@ let ws = null;
                     bubble.appendChild(quoteDiv);
                 }
 
-                ChatCore.renderSegments(bubble, data);
+                const oldImagePlan = isOldMediaMessage(data) ? deferredImagePlan(data) : null;
+                if (oldImagePlan && oldImagePlan.urls.length) {
+                    const view = Object.assign({}, data);
+                    view.segments = oldImagePlan.segments;
+                    ChatCore.renderSegments(bubble, view);
+                    appendDeferredImages(bubble, oldImagePlan.urls);
+                } else {
+                    ChatCore.renderSegments(bubble, data);
+                    bubble.querySelectorAll('img').forEach(img => {
+                        const src = img.getAttribute('src');
+                        let tried = false;
+                        img.addEventListener('load', function () {
+                            if (messageArea.scrollHeight - messageArea.scrollTop - messageArea.clientHeight < 120) messageArea.scrollTop = messageArea.scrollHeight;
+                        });
+                        img.addEventListener('error', function () {
+                            if (tried || !src) return;
+                            tried = true;
+                            setTimeout(function () { img.style.display = ''; img.src = src + (src.indexOf('?') >= 0 ? '&' : '?') + 'nr_retry=1'; }, 900);
+                        });
+                    });
+                }
 
                             bubble.addEventListener('contextmenu', (e) => {
                     e.preventDefault();
@@ -824,6 +844,45 @@ let ws = null;
                 if(scroll) messageArea.scrollTop = messageArea.scrollHeight;
             }
 
+            function isOldMediaMessage(data) {
+                const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/.exec(String(data.time || ''));
+                if (!m) return true;
+                const t = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)).getTime();
+                return Date.now() - t > 3600 * 1000;
+            }
+            function deferredImagePlan(data) {
+                const list = ChatCore.segments(data), urls = [], segments = [];
+                list.forEach(s => {
+                    if (s && s.type === 'image') {
+                        const d = s.data || s, u = d.url || d.media_url || d.file;
+                        if (u) urls.push(u);
+                        segments.push({type: 'text', text: '[图片]'});
+                    } else segments.push(s);
+                });
+                return {urls, segments};
+            }
+            function appendDeferredImages(bubble, urls) {
+                const box = document.createElement('div');
+                box.className = 'flex flex-col gap-1 my-1';
+                urls.forEach(url => {
+                    const row = document.createElement('div');
+                    row.className = 'flex items-center gap-2 text-xs text-gray-500';
+                    const label = document.createElement('span'); label.textContent = '图片信息';
+                    const btn = document.createElement('button'); btn.type = 'button'; btn.textContent = '下载';
+                    btn.className = 'px-2 py-0.5 rounded-full border border-blue-500 text-blue-500 bg-white';
+                    btn.onclick = () => {
+                        btn.disabled = true; label.textContent = '加载中…';
+                        const img = document.createElement('img');
+                        img.className = 'rounded-lg max-w-full max-h-60 block';
+                        img.onload = () => { if (row.parentNode) row.remove(); if (messageArea.scrollHeight - messageArea.scrollTop - messageArea.clientHeight < 120) messageArea.scrollTop = messageArea.scrollHeight; };
+                        img.onerror = () => { if (img.parentNode) img.remove(); btn.disabled = false; label.textContent = '图片信息（加载失败，可重试）'; };
+                        bubble.appendChild(img);
+                        img.src = url.indexOf('/files/') === 0 ? url : '/proxy_img?url=' + encodeURIComponent(url);
+                    };
+                    row.appendChild(label); row.appendChild(btn); box.appendChild(row);
+                });
+                bubble.appendChild(box);
+            }
             function updateRecallUI(messageId, senderName) {
                 const row = document.getElementById(`msg-${messageId}`);
                 if (row) {

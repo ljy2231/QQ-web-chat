@@ -300,6 +300,21 @@ test('NR defers images older than one hour and loads them from the download acti
  const newNode=h.run('buildMessage('+JSON.stringify({target_id:'private:1',message_id:'new',direction:'incoming',time:ts,revision:2,segments:[{type:'image',url:'/files/new.png'}]})+')');
  assert.ok(findTag(newNode,'img'));
  findClass(oldNode,'nr-late-download').onclick();
- assert.equal(h.nodes['nrViewer'].style.display,'block');
+ assert.ok(findTag(oldNode,'img'));
+});
+test('main defers old images and shows them on download, keeps recent images inline',()=>{
+ const h=harness('main');
+ h.run("currentTargetId='private:1'");
+ const oldMsg={target_id:'private:1',message_id:'old',direction:'incoming',time:'2020-01-01 00:00:00',revision:1,sender_name:'synthetic',segments:[{type:'image',url:'/files/old.png'}]};
+ h.run('appendMessage('+JSON.stringify(oldMsg)+')');
+ const oldRow=h.ctx.document.getElementById('msg-old');
+ assert.ok(oldRow.textContent.includes('图片信息'));
+ assert.equal(findTag(oldRow,'img'),null);
+ findTag(oldRow,'button').onclick();
+ assert.ok(findTag(oldRow,'img'));
+ const now=new Date(), pad=n=>String(n).padStart(2,'0');
+ const ts=now.getFullYear()+'-'+pad(now.getMonth()+1)+'-'+pad(now.getDate())+' '+pad(now.getHours())+':'+pad(now.getMinutes())+':'+pad(now.getSeconds());
+ h.run('appendMessage('+JSON.stringify({target_id:'private:1',message_id:'recent',direction:'incoming',time:ts,revision:2,sender_name:'synthetic',segments:[{type:'image',url:'/files/recent.png'}]})+')');
+ assert.ok(findTag(h.ctx.document.getElementById('msg-recent'),'img'));
 });
 console.log('PASS '+count+' synthetic frontend tests (no browser/device assertions)');
