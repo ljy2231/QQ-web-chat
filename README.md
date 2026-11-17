@@ -8,7 +8,7 @@
 
 ## 快速运行
 
-需要 Python **3.12**、已由你维护的 NapCat，以及生产环境 HTTPS 反向代理。
+需要 Python **3.12**、任意NapCat 或 任何支持WS的QQbot框架，以及生产环境 HTTPS 反向代理。
 
 ```sh
 python3 -m venv .venv
