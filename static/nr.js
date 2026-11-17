@@ -2,12 +2,19 @@
 var session = null, connection = null, myQQ = null, contacts = {}, currentId = null, currentType = null;
 var pendingFile = null, currentXHR = null, quoteMsg = null, store = new ChatCore.Store();
 var composing = false, historyTimer = null, sessionRequest = null, sessionGeneration = 0, logoutGeneration = 0, logoutPending = false;
-var NR_BUILD = 'NR v3';
+var NR_BUILD = 'NR v4';
 var wsToken = null;
 try { wsToken = window.sessionStorage.getItem('nr_ws_token'); } catch (ignore) {}
 function $(id) { return document.getElementById(id); }
 function esc(s) { return String(s === null || s === undefined ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
-function notice(text) { $('feedback').textContent = text; updateComposer(); }
+var noticeTimer = null;
+function notice(text, autoClear) {
+    $('feedback').textContent = text; updateComposer();
+    clearTimeout(noticeTimer);
+    if (autoClear && text) noticeTimer = setTimeout(function () {
+        if ($('feedback').textContent === text) { $('feedback').textContent = ''; updateComposer(); }
+    }, 4000);
+}
 function updateStatus() {
     $('status').textContent = (connection ? ChatCore.status(connection) : 'Web：未连接 · NapCat：未知 · QQ：未知') + ' · ' + NR_BUILD + (window.WebSocket ? '' : ' · 不支持WebSocket');
     $('sendBtn').disabled = !currentId || currentId.indexOf('legacy:') === 0 || !connection || connection.state !== 'open' || !connection.napcat || !connection.qq;
@@ -64,7 +71,7 @@ function connect() {
         event: handle,
         expired: function() { clearSession('登录已过期，请重新登录；未确认发送仅保留查询编号', true); },
         disconnected: function() { store.uncertain(); renderCurrent(); },
-        tick: function() { if (store.uncertain(90000)) renderCurrent(); }
+        tick: function() { if (store.uncertain(90000)) { notice('发送结果未知，请核实，勿重复发送'); renderCurrent(); } }
     });
     connection.open();
 }
@@ -78,7 +85,15 @@ function handle(d) {
             clearTimeout(historyTimer); var loading = $('history-loading'); if (loading && loading.parentNode) loading.parentNode.removeChild(loading);
             renderCurrent();
         }
-    } else if (d.type === 'send_result') { if (store.result(d)) renderCurrent(); }
+    } else if (d.type === 'send_result') {
+        var item = store.result(d);
+        if (item) {
+            var label = item.status === 'confirmed' ? '已发送'
+                : (item.detail || ChatCore.labels[item.status] || item.status);
+            notice(label, item.status === 'confirmed');
+            renderCurrent();
+        }
+    }
     else if (d.type === 'toast') { notice(d.content); finishHistory('历史未完成或请求异常：' + d.content); }
     else if (d.type === 'message_recalled') {
         store.recall(d);

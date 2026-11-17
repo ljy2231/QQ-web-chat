@@ -214,6 +214,14 @@ test('shared/NR files keep ES5-only syntax and no bearer persistence',()=>{
   assert.ok(!/sessionStorage\.setItem\([^\n]*token/.test(file==='static/chat-core.js'?code:''),file);
  }
 });
+test('NR send result replaces the pending notice',()=>{
+ const h=harness('nr');
+ h.run("session=ChatCore.id();currentId='private:1';currentType='private';connection={send:function(){return true;},state:'open',napcat:true,qq:true};payload=store.begin('private:1','private',{text:'x'});notice('已提交，等待服务器确认');");
+ h.run("handle({type:'send_result',request_id:payload.request_id,status:'confirmed',content:'已发送'})");
+ assert.equal(h.nodes['feedback'].textContent,'已发送');
+ h.run("payload2=store.begin('private:1','private',{text:'y'});handle({type:'send_result',request_id:payload2.request_id,status:'failed',content:'发送失败'})");
+ assert.equal(h.nodes['feedback'].textContent,'发送失败');
+});
 test('expiry retains lookup identities only until explicit logout',()=>{
  for(const page of ['main','nr']) {
   const h=harness(page),main=page==='main';h.run('enterSession()');
