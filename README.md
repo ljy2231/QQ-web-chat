@@ -6,6 +6,14 @@
 - Python aiohttp + SQLite 行级存储；浏览器使用同源 HttpOnly 会话 Cookie。
 - 本项目不是多租户平台；共享网页密码意味着共享全部聊天与管理权限。
 
+## 在线演示
+
+纯静态界面演示，不需要后端，也不连接 QQ；演示密码 `admin`。
+
+**https://ljy2231.github.io/QQ-Web-Chat-Demo/**
+
+源码：[QQ-Web-Chat-Demo](https://github.com/ljy2231/QQ-Web-Chat-Demo)
+
 ## 快速运行
 
 需要 Python **3.12**、NapCat 或 任何支持WS的QQbot框架，以及生产环境 HTTPS 反向代理。
