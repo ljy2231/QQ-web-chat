@@ -226,7 +226,10 @@ try { localStorage.removeItem('webchat_token'); } catch (ignore) {}
     sessionRequest = ChatCore.request('GET', '/api/session', null, function(status, data) {
         if (generation !== sessionGeneration) return;
         sessionRequest = null;
-        if (status === 200 && data && data.authenticated) enterSession();
+        if (status === 200 && data && data.authenticated) {
+            if (data.ws_token) { wsToken = data.ws_token; try { window.sessionStorage.setItem('nr_ws_token', wsToken); } catch (ignore) {} }
+            enterSession();
+        }
         else if (status === 0) $('loginErr').textContent = '会话检查超时，请重新登录';
     });
 }());

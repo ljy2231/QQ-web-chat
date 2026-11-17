@@ -423,7 +423,12 @@ class SessionManager:
 
     async def session_handler(self, request):
         session = self.authenticate(request)
-        return web.json_response({"authenticated": session is not None}, status=200 if session else 401,
+        if session is None:
+            return web.json_response({"authenticated": False}, status=401,
+                                     headers={"Cache-Control": "no-store"})
+        # Old Android WebViews omit cookies on WebSocket upgrades, so an already
+        # authenticated same-origin page may use this token for the WS handshake.
+        return web.json_response({"authenticated": True, "ws_token": session.token},
                                  headers={"Cache-Control": "no-store"})
 
     async def restore_handler(self, request):

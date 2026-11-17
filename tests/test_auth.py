@@ -165,7 +165,9 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.cookies[COOKIE_NAME]["samesite"], "Strict")
         self.assertEqual(response.headers["Cache-Control"], "no-store")
         status = await self.client.get("/api/session")
-        self.assertEqual(await status.json(), {"authenticated": True})
+        body = await status.json();
+        self.assertTrue(body["authenticated"]);
+        self.assertTrue(isinstance(body.get("ws_token"), str) and len(body["ws_token"]) >= 20)
         response = await self.client.post("/api/login", json={"password_hash": hashlib.sha256(PASSWORD.encode()).hexdigest()})
         self.assertEqual(response.status, 401)
         second, _ = await self.login()
