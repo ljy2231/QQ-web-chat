@@ -7,7 +7,7 @@ var wsToken = null;
 try { wsToken = window.sessionStorage.getItem('nr_ws_token'); } catch (ignore) {}
 function $(id) { return document.getElementById(id); }
 function esc(s) { return String(s === null || s === undefined ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
-function notice(text) { $('feedback').textContent = text; }
+function notice(text) { $('feedback').textContent = text; updateComposer(); }
 function updateStatus() {
     $('status').textContent = (connection ? ChatCore.status(connection) : 'Web：未连接 · NapCat：未知 · QQ：未知') + ' · ' + NR_BUILD + (window.WebSocket ? '' : ' · 不支持WebSocket');
     $('sendBtn').disabled = !currentId || currentId.indexOf('legacy:') === 0 || !connection || connection.state !== 'open' || !connection.napcat || !connection.qq;
@@ -117,6 +117,8 @@ function updateComposer() {
     $('cancelQuote').style.display = quoteMsg ? 'inline' : 'none';
     $('filePreview').textContent = pendingFile ? pendingFile.name + (pendingFile.local_path ? '（已上传）' : '（上传中）') : '';
     $('cancelFile').style.display = pendingFile ? 'inline' : 'none';
+    var info = $('composerInfo'), show = !!(quoteMsg || pendingFile || $('feedback').textContent);
+    if (info) info.style.display = show ? 'block' : 'none';
 }
 function switchChat(id) {
     var c = contacts[id]; if (!c) return;
