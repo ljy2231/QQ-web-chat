@@ -859,7 +859,13 @@ async def process_inbound(data):
     target = conversation_key(kind, peer)
     segments, content, quote_id = normalize_segments(data.get('message', ''))
     blacklist = set(settings.get('blacklist', []))
-    if peer in blacklist or sender_id in blacklist or peer not in set(settings.get('whitelist', [])):
+    if peer in blacklist or sender_id in blacklist:
+        return
+    if peer not in set(settings.get('whitelist', [])):
+        # Restore the original unauthorized hint: only a private '=' message is answered.
+        if kind == 'private' and content.startswith('='):
+            await send_qq_api('send_private_msg', {'user_id': int(peer),
+                                                   'message': f'你的ID:{sender_id} 当前未授权，请联系管理员授权'})
         return
     command = all_command(content, kind, sender_id, ADMIN_QQ_ID)
     action = 'send_private_msg' if kind == 'private' else 'send_group_msg'

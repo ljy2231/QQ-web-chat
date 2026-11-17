@@ -277,6 +277,41 @@ class MessagingIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await self.s.process_inbound(self.incoming(5, kind='group', content='='))
             self.assertEqual(len(calls), count)
 
+    async def test_unauthorized_private_equals_hint_is_preserved(self):
+        self.s.ADMIN_QQ_ID = '12'
+        calls = []
+        async def fake(action, params):
+            calls.append((action, params.get('message')))
+        with patch.object(self.s, 'send_qq_api', fake):
+            await self.allow('12')
+            stranger = self.incoming(1, content='= hi')
+            stranger['sender']['user_id'] = 77
+            stranger['user_id'] = 77
+            await self.s.process_inbound(stranger)
+            self.assertEqual(calls[-1], ('send_private_msg', '你的ID:77 当前未授权，请联系管理员授权'))
+            self.assertEqual((await self.s.store.call('history', 'private:77'))['messages'], [])
+            # An unauthorized ordinary private message and a group message stay silent.
+            count = len(calls)
+            plain = self.incoming(2, content='= hello')
+            plain['sender']['user_id'] = 78
+            plain['user_id'] = 78
+            plain['message'] = [{'type': 'text', 'data': {'text': 'hello'}}]
+            await self.s.process_inbound(plain)
+            group_plain = self.incoming(3, kind='group', content='= group')
+            group_plain['group_id'] = 79
+            await self.s.process_inbound(group_plain)
+            self.assertEqual(len(calls), count)
+            # A blacklisted private contact is ignored even with '='.
+            settings = await self.s.store.call('get_settings')
+            settings['settings']['blacklist'] = ['80']
+            await self.s.store.call('save_settings', settings['settings'], settings['revision'])
+            self.s.settings.update(settings['settings'])
+            blocked = self.incoming(4, content='= hi')
+            blocked['sender']['user_id'] = 80
+            blocked['user_id'] = 80
+            await self.s.process_inbound(blocked)
+            self.assertEqual(len(calls), count)
+
     async def test_durable_inbox_replay(self):
         await self.allow('12')
         event = self.incoming(11)
