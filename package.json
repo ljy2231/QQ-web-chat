@@ -2,6 +2,7 @@
   "name": "qq-web-chat-assets",
   "private": true,
   "version": "0.2.0",
+  "license": "MIT",
   "description": "Build-time only CSS tooling; no CDN script required at runtime",
   "scripts": {
     "build:css": "tailwindcss -c tailwind.config.cjs -i assets/tailwind.css -o static/tailwind.css --minify"

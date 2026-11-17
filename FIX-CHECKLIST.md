@@ -27,4 +27,4 @@
 | 运维 | root/资源/备份 | 专用用户、systemd保护、配额、健康/就绪、备份恢复 |
 | 工程 | 单文件/无CI/外部CDN | 拆auth/storage/messaging/templates静态资源、CI与锁文件、本地CSS |
 | 真机 | NR兼容 | ES5合成测试不等于Android5.1真机验收，需用户验证 |
-| 许可 | LICENSE/提示音权利 | 不擅自授予开源许可，维护者决定 |
+| 许可 | LICENSE/提示音权利 | 原创代码和文档已采用MIT；第三方资源仍遵循各自权利与许可 |
