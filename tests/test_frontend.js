@@ -276,4 +276,30 @@ test('NR appends new messages without rebuilding existing nodes',()=>{
  assert.equal(h.ctx.document.getElementById('msg-a'),first);
  assert.ok(h.ctx.document.getElementById('msg-b'));
 });
+function findTag(node, tag) {
+  if (!node) return null;
+  if (node.tagName === tag) return node;
+  for (const child of node.children || []) { const found = findTag(child, tag); if (found) return found; }
+  return null;
+}
+function findClass(node, name) {
+  if (!node) return null;
+  if (String(node.className || '').split(' ').indexOf(name) >= 0) return node;
+  for (const child of node.children || []) { const found = findClass(child, name); if (found) return found; }
+  return null;
+}
+test('NR defers images older than one hour and loads them from the download action',()=>{
+ const h=harness('nr');
+ const oldMsg={target_id:'private:1',message_id:'old',direction:'incoming',time:'2020-01-01 00:00:00',revision:1,segments:[{type:'image',url:'/files/old.png'}]};
+ const oldNode=h.run('buildMessage('+JSON.stringify(oldMsg)+')');
+ assert.ok(oldNode.textContent.includes('图片信息'));
+ assert.ok(oldNode.textContent.includes('下载'));
+ assert.equal(findTag(oldNode,'img'),null);
+ const now=new Date(), pad=n=>String(n).padStart(2,'0');
+ const ts=now.getFullYear()+'-'+pad(now.getMonth()+1)+'-'+pad(now.getDate())+' '+pad(now.getHours())+':'+pad(now.getMinutes())+':'+pad(now.getSeconds());
+ const newNode=h.run('buildMessage('+JSON.stringify({target_id:'private:1',message_id:'new',direction:'incoming',time:ts,revision:2,segments:[{type:'image',url:'/files/new.png'}]})+')');
+ assert.ok(findTag(newNode,'img'));
+ findClass(oldNode,'nr-late-download').onclick();
+ assert.equal(h.nodes['nrViewer'].style.display,'block');
+});
 console.log('PASS '+count+' synthetic frontend tests (no browser/device assertions)');

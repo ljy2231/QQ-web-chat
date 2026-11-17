@@ -2,8 +2,9 @@
 var session = null, connection = null, myQQ = null, contacts = {}, currentId = null, currentType = null;
 var pendingFile = null, currentXHR = null, quoteMsg = null, store = new ChatCore.Store();
 var composing = false, historyTimer = null, sessionRequest = null, sessionGeneration = 0, logoutGeneration = 0, logoutPending = false;
-var NR_BUILD = 'NR v6';
+var NR_BUILD = 'NR v7';
 var nrView = {open: false, scale: 1, tx: 0, ty: 0}, nrDrag = null, NR_MIN_SCALE = 1, NR_MAX_SCALE = 5, NR_ZOOM_STEP = 1.35;
+var nrStick = true;
 var wsToken = null;
 try { wsToken = window.sessionStorage.getItem('nr_ws_token'); } catch (ignore) {}
 function $(id) { return document.getElementById(id); }
@@ -153,6 +154,47 @@ function requestHistory() {
     if (!connection || !connection.send({type: 'get_history', target_id: target})) { finishHistory('Web 断开，重连后重新加载'); return; }
     historyTimer = setTimeout(function() { if (target === currentId) finishHistory('历史加载超时，请重新选择会话重试'); }, 12000);
 }
+var NR_AUTO_IMAGE_MS = 3600 * 1000;
+function nrParseTime(text) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/.exec(String(text || ''));
+    if (!m) return null;
+    return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)).getTime();
+}
+function nrImageDeferred(m) {
+    var t = nrParseTime(m.time);
+    if (t === null) return true;
+    return Date.now() - t > NR_AUTO_IMAGE_MS;
+}
+function nrOldImagePlan(m) {
+    var list = ChatCore.segments(m), urls = [], out = [], i, s, d, url;
+    for (i = 0; i < list.length; i++) {
+        s = list[i] || {};
+        if (s.type === 'image') {
+            d = s.data || s; url = d.url || d.media_url || d.file;
+            if (url) urls.push(url);
+            out.push({type: 'text', text: '[图片]'});
+        } else out.push(s);
+    }
+    return {urls: urls, segments: out};
+}
+function nrCopyMessage(m, segments) {
+    var copy = {}, k;
+    for (k in m) if (Object.prototype.hasOwnProperty.call(m, k)) copy[k] = m[k];
+    copy.segments = segments;
+    return copy;
+}
+function nrAppendDeferred(bubble, urls) {
+    var box = document.createElement('div'), i, row, label, btn;
+    box.className = 'nr-late-media';
+    for (i = 0; i < urls.length; i++) {
+        row = document.createElement('div'); row.className = 'nr-late-row';
+        label = document.createElement('span'); label.className = 'nr-late-label'; label.textContent = '图片信息';
+        btn = document.createElement('button'); btn.type = 'button'; btn.className = 'nr-late-download'; btn.textContent = '下载';
+        btn.onclick = (function (url) { return function () { nrOpenImage(url); }; })(urls[i]);
+        row.appendChild(label); row.appendChild(btn); box.appendChild(row);
+    }
+    bubble.appendChild(box);
+}
 function nrNearBottom(area) {
     if (!area || typeof area.clientHeight !== 'number') return false;
     return area.scrollHeight - area.scrollTop - area.clientHeight < 80;
@@ -174,7 +216,7 @@ function nrWatchImage(img, area) {
     img.__nrSrc = img.getAttribute('src') || img.src;
     img.onload = function () {
         if (prevLoad) { try { prevLoad.call(this); } catch (ignore) {} }
-        if (nrNearBottom(area)) nrScrollBottom(area);
+        if (nrStick) nrScrollBottom(area);
     };
     img.onerror = function () {
         if (prevError) { try { prevError.call(this); } catch (ignore) {} }
@@ -222,8 +264,8 @@ function renderCurrent(force) {
     });
     area.appendChild(states);
     nrWatchImages(area);
-    if (stick) nrScrollBottom(area);
-    else if (isFinite(fromBottom)) area.scrollTop = area.scrollHeight - fromBottom;
+    if (stick) { nrStick = true; nrScrollBottom(area); }
+    else { nrStick = false; if (isFinite(fromBottom)) area.scrollTop = area.scrollHeight - fromBottom; }
 }
 function appendMessage(m) {
     if (m.target_id !== currentId || $('msg-' + m.message_id)) return;
@@ -242,7 +284,11 @@ function buildMessage(m) {
         q.onclick = function() { var target = $('msg-' + m.quote.id); if (target) target.scrollIntoView(); else notice('引用消息已不在当前历史中'); };
         bubble.appendChild(q);
     }
-    ChatCore.renderSegments(bubble, m); div.appendChild(bubble);
+    var deferred = nrImageDeferred(m) ? nrOldImagePlan(m) : null;
+    if (deferred && deferred.urls.length) ChatCore.renderSegments(bubble, nrCopyMessage(m, deferred.segments));
+    else ChatCore.renderSegments(bubble, m);
+    div.appendChild(bubble);
+    if (deferred && deferred.urls.length) nrAppendDeferred(bubble, deferred.urls);
     var actions = document.createElement('div'), reply = document.createElement('button'); reply.className = 'recall'; reply.type = 'button'; reply.textContent = '引用';
     reply.onclick = function() { if (currentId.indexOf('legacy:') === 0) { notice('归档仅供查看'); return; } quoteMsg = {id: m.message_id, sender_name: m.sender_name, content: m.content}; updateComposer(); $('msgInput').focus(); };
     actions.appendChild(reply);
@@ -384,6 +430,7 @@ function nrEndDrag() {
 function nrBindViewer() {
     var box = $('messages'), stage = $('nrViewerStage');
     if (!box || !stage) return;
+    box.addEventListener('scroll', function () { nrStick = nrNearBottom(box); }, false);
     box.addEventListener('click', function (e) {
         e = e || window.event;
         var t = e.target || e.srcElement;

@@ -72,6 +72,12 @@ button:disabled{opacity:.5;} .message-segment{margin:2px 0;}
 #nrViewerBar button{display:inline-block;width:44%;max-width:180px;height:40px;margin:8px 5px;border:0;border-radius:6px;background:#2f5bd3;color:#fff;font-size:16px;}
 #nrViewerBar button:disabled{background:#3a3a3a;color:#999;}
 #nrViewerClose{position:absolute;right:8px;top:8px;width:40px;height:40px;border:0;border-radius:20px;background:rgba(255,255,255,.18);color:#fff;font-size:22px;line-height:40px;padding:0;z-index:4;}
+.nr-late-media{margin:4px 0;padding:2px 0;}
+.nr-late-row{margin:3px 0;}
+.nr-late-label{color:#888;font-size:12px;margin-right:8px;}
+.nr-late-download{height:26px;padding:0 12px;border:1px solid #3b82f6;border-radius:13px;background:#fff;color:#3b82f6;font-size:12px;}
+.msg.self .nr-late-label{color:#dbe7ff;}
+.msg.self .nr-late-download{background:#fff;border-color:#fff;color:#2f5bd3;}
 </style>
 </head>
 <body>
@@ -81,7 +87,7 @@ button:disabled{opacity:.5;} .message-segment{margin:2px 0;}
     <input id="pwd" type="password" placeholder="请输入访问密码">
     <button type="button" id="loginBtn">进入聊天</button>
     <div class="err" id="loginErr"></div>
-    <div style="color:#bbb;font-size:11px;margin-top:6px">NR v6 · WebSocket 兼容版</div>
+    <div style="color:#bbb;font-size:11px;margin-top:6px">NR v7 · WebSocket 兼容版</div>
     <button type="button" id="retryLogout">重试注销</button>
   </div>
 </div>
@@ -119,6 +125,6 @@ button:disabled{opacity:.5;} .message-segment{margin:2px 0;}
   <button type="button" id="nrViewerClose" aria-label="关闭">×</button>
 </div>
 <script src="/static/chat-core.js?v=4"></script>
-<script src="/static/nr.js?v=6" defer></script>
+<script src="/static/nr.js?v=7" defer></script>
 </body>
 </html>
