@@ -139,13 +139,16 @@ def validate_request_id(value):
     return value
 
 
-def all_command(content, kind, sender_id, admin_id):
-    """Return explicit mode or help; reject non-admin/private command usage."""
-    words = content.upper().split()
-    if words[:2] != ['=', 'ALL']:
+def all_command(content, kind):
+    """Parse a per-chat command after the caller's blacklist/whitelist checks."""
+    text = content.strip()
+    if not text.startswith('='):
         return None
-    if kind != 'private' or not admin_id or str(sender_id) != str(admin_id):
+    words = text[1:].upper().split()
+    if words[:1] != ['ALL']:
+        return None
+    if kind != 'private':
         return 'denied'
-    if len(words) == 3 and words[2] in ('ON', 'OFF'):
-        return words[2] == 'ON'
+    if len(words) == 2 and words[1] in ('ON', 'OFF'):
+        return words[1] == 'ON'
     return 'help'

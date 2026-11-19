@@ -880,7 +880,7 @@ async def process_inbound(data):
             await send_qq_api('send_private_msg', {'user_id': int(peer),
                                                    'message': f'你的ID:{sender_id} 当前未授权，请联系管理员授权'})
         return
-    command = all_command(content, kind, sender_id, current_admin())
+    command = all_command(content, kind)
     action = 'send_private_msg' if kind == 'private' else 'send_group_msg'
     params = {'user_id' if kind == 'private' else 'group_id': int(peer)}
     if command is not None:
@@ -891,7 +891,7 @@ async def process_inbound(data):
             enabled = await store.call('get_mode', target)
             tip = '当前会话全量转发：' + ('ON' if enabled else 'OFF') + '；使用 = ALL ON 或 = ALL OFF'
         else:
-            tip = '仅管理员私聊可使用此命令'
+            tip = '全量转发命令仅限私聊使用'
         await send_qq_api(action, {**params, 'message': tip})
         return
     if content.upper() in ('= CLEAR', '= REBOOT'):

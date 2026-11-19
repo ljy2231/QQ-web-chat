@@ -47,9 +47,13 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn('[语音]', text)
         self.assertIn('[不支持的消息段]', text)
         self.assertIsNone(segments[2]['url'])
-        self.assertEqual(all_command('= ALL', 'private', '1', '1'), 'help')
-        self.assertIs(all_command('= ALL ON', 'private', '1', '1'), True)
-        self.assertEqual(all_command('= ALL ON', 'group', '1', '1'), 'denied')
+        for prefix in ('=all', '= all', '=  AlL'):
+            self.assertEqual(all_command(prefix, 'private'), 'help')
+            self.assertIs(all_command(prefix + ' ON', 'private'), True)
+            self.assertIs(all_command(prefix + ' off', 'private'), False)
+            self.assertEqual(all_command(prefix + ' ON', 'group'), 'denied')
+        for ordinary in ('all on', '=alligator', '=allON'):
+            self.assertIsNone(all_command(ordinary, 'private'))
 
 
 class MessagingIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -351,14 +355,21 @@ class MessagingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         await response.read()
         self.assertEqual(self.s.current_admin(), '13')
-        # The old ID loses the command; the new stored ID gains it.
-        await self.s.process_inbound(self.incoming(1, content='= ALL ON'))
+        # ALL is personal; changing admins does not revoke a user's own switch.
+        await self.s.process_inbound(self.incoming(1, content='=all on'))
+        await self.s.process_inbound(self.incoming(2, content='= all'))
+        self.assertTrue(await self.s.store.call('get_mode', 'private:12'))
+        self.assertFalse(await self.s.store.call('get_mode', 'private:13'))
+        await self.s.process_inbound(self.incoming(3, content='= ALL OFF'))
         self.assertFalse(await self.s.store.call('get_mode', 'private:12'))
-        other = self.incoming(2, content='= ALL ON')
-        other['sender']['user_id'] = 13
-        other['user_id'] = 13
-        await self.s.process_inbound(other)
-        self.assertTrue(await self.s.store.call('get_mode', 'private:13'))
+        # A privileged command still follows the new admin identity.
+        with patch.object(self.s, 'clear_history') as clear:
+            await self.s.process_inbound(self.incoming(4, content='= CLEAR'))
+            clear.assert_not_awaited()
+            other = self.incoming(5, content='= CLEAR')
+            other['sender']['user_id'] = other['user_id'] = 13
+            await self.s.process_inbound(other)
+            clear.assert_awaited_once_with('private:13')
         # Invalid administrator IDs are rejected and do not replace the stored value.
         current = await self.s.store.call('get_settings')
         response = await self.http.post(self.base + '/api/settings',
