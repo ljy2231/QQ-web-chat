@@ -164,7 +164,8 @@
             </div>
             <div class="border-t border-gray-200 bg-gray-50 px-3 py-2 shrink-0 flex items-center justify-between">
                 <button id="logout-btn" type="button" class="px-3 py-1.5 text-xs rounded-md border border-gray-300 text-gray-600 bg-white hover:text-red-500 hover:border-red-300 transition-colors">退出登录</button>
-                <button id="refresh-bg-btn" type="button" class="text-xs text-gray-400 hover:text-gray-600 transition-colors">随机壁纸</button>
+                <button id="refresh-bg-btn" type="button" hidden class="text-xs text-gray-400 hover:text-gray-600 transition-colors">随机壁纸</button>
+                <button id="download-bg-btn" type="button" hidden disabled title="下载当前聊天壁纸" class="text-xs text-gray-400 hover:text-gray-600 transition-colors">下载壁纸</button>
                 <button id="settings-btn" type="button" class="text-xs text-gray-400 hover:text-gray-600 transition-colors">设置</button>
             </div>
         </div>
@@ -229,7 +230,7 @@
         </div>
 
         <script src="/static/chat-core.js"></script>
-<script src="/static/main.js" defer></script>
+<script src="/static/main.js?v=wallpaper-actions-2" defer></script>
 
         <div id="settings-modal" class="fixed inset-0 z-[10000] hidden">
             <div class="absolute inset-0 bg-black/40" id="settings-mask"></div>

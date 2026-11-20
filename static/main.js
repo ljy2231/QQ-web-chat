@@ -42,6 +42,7 @@ let ws = null;
             const settingsBtn = document.getElementById('settings-btn');
             const refreshBgBtn = document.getElementById('refresh-bg-btn');
             const saveWallpaperBtn = document.getElementById('save-wallpaper-btn');
+            const downloadBgBtn = document.getElementById('download-bg-btn');
             (function enableCardAfterIntro() {
                 const c = document.getElementById('login-card');
                 if (!c) return;
@@ -433,6 +434,12 @@ let ws = null;
                 const visible = !!authToken && loginOverlay.style.display === 'none';
                 saveWallpaperBtn.hidden = !visible;
                 saveWallpaperBtn.disabled = !(visible && uiCfg.chat_background && wallpaperBlob);
+                const showBgActions = visible && uiCfg.chat_background;
+                refreshBgBtn.hidden = !showBgActions;
+                if (downloadBgBtn) {
+                    downloadBgBtn.hidden = !showBgActions;
+                    downloadBgBtn.disabled = saveWallpaperBtn.disabled;
+                }
                 document.body.classList.toggle('wallpaper-save-visible', visible);
                 refreshBgBtn.disabled = !!wallpaperRequest;
             }
@@ -556,6 +563,7 @@ let ws = null;
                 if (await ensureWallpaper(true)) showToast('壁纸已刷新');
             });
             if (saveWallpaperBtn) saveWallpaperBtn.addEventListener('click', saveCurrentWallpaper);
+            if (downloadBgBtn) downloadBgBtn.addEventListener('click', saveCurrentWallpaper);
             loginBtn.addEventListener('click', doLogin);
             loginPwd.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) doLogin(); });
 
