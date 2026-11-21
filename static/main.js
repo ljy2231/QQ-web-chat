@@ -656,7 +656,9 @@ let ws = null;
                 if (loading) messageArea.appendChild(loading);
                 store.list(currentTargetId).forEach(m => appendMessage(m, false));
                 const states = document.createElement('div'); states.id = 'send-states';
-                ChatCore.renderOutbox(states, store, currentTargetId, function(item) {
+                // Published outgoing bubbles carry the success mark; keep only actionable or unfinished receipts here.
+                const outstanding = {outbox: store.outbox, order: store.order.filter(id => store.outbox[id].status !== 'confirmed')};
+                ChatCore.renderOutbox(states, outstanding, currentTargetId, function(item) {
                     if ((inputBox.value || pendingFile || quoteMsg) && !confirm('恢复将替换当前编辑草稿，是否继续？')) return;
                     restoreDraft(item.draft); saveDraft(); inputBox.focus();
                 });
@@ -846,7 +848,14 @@ let ws = null;
                 });
 
                 col.appendChild(meta);
-                col.appendChild(bubble);
+                if (isSelf) {
+                    const sent = document.createElement('div');
+                    sent.className = 'sent-bubble';
+                    const mark = document.createElement('span');
+                    mark.className = 'sent-check'; mark.textContent = '✓';
+                    mark.title = '已发送'; mark.setAttribute('role', 'img'); mark.setAttribute('aria-label', '已发送');
+                    sent.appendChild(mark); sent.appendChild(bubble); col.appendChild(sent);
+                } else col.appendChild(bubble);
                 row.appendChild(col);
                 messageArea.appendChild(row);
                 if(scroll) messageArea.scrollTop = messageArea.scrollHeight;

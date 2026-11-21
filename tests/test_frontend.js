@@ -317,4 +317,18 @@ test('main defers old images and shows them on download, keeps recent images inl
  h.run('appendMessage('+JSON.stringify({target_id:'private:1',message_id:'recent',direction:'incoming',time:ts,revision:2,sender_name:'synthetic',segments:[{type:'image',url:'/files/recent.png'}]})+')');
  assert.ok(findTag(h.ctx.document.getElementById('msg-recent'),'img'));
 });
+test('main shows one check per published outgoing bubble, not a second confirmed receipt',()=>{
+ const h=harness('main'); h.run("currentTargetId='private:1'");
+ for(const status of ['confirmed','failed','unknown','pending','partial']) {
+   h.run(`{const p=store.begin(currentTargetId,'private',{text:'draft'});handleEvent({type:'send_result',request_id:p.request_id,status:'${status}'})}`);
+ }
+ const states=h.nodes['send-states'];assert.deepEqual(states.children.map(n=>n.getAttribute('data-status')),['failed','unknown','pending','partial']);
+ assert.ok(findTag(states.children[0],'button'));
+ for(const [id,direction,recalled] of [['a','outgoing',false],['b','incoming',false],['c','outgoing',true]]) {
+   h.run('appendMessage('+JSON.stringify({target_id:'private:1',message_id:id,direction,is_recalled:recalled,content:'sample'})+')');
+   const mark=findClass(h.nodes['msg-'+id],'sent-check');
+   if(id==='a') { assert.equal(mark.textContent,'✓');assert.strictEqual(mark.parentNode.children[0],mark);assert.equal(mark.parentNode.children[1].textContent,'sample'); }
+   else assert.equal(mark,null);
+ }
+});
 console.log('PASS '+count+' synthetic frontend tests (no browser/device assertions)');

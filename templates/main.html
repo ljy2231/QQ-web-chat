@@ -92,6 +92,10 @@
             body.wallpaper-save-visible #chat-area > div:first-child { padding-right: 112px; }
             @media (max-width: 767px) { body.wallpaper-save-visible #sidebar > div:first-child { padding-right: 112px; } }
         @media (prefers-reduced-motion: reduce) { #login-card, #login-card > * { animation: none; opacity: 1; transform: none; pointer-events: auto; } #login-bg .blob { animation: none; } }
+.sent-bubble { display: flex; align-items: center; gap: 6px; max-width: 100%; }
+.sent-bubble > div { min-width: 0; }
+.sent-check { flex: none; color: #15803d; font-size: 13px; font-weight: bold; user-select: none; }
+body.theme-dark .sent-check { color: #86efac; }
 .send-state { margin: 6px 0; padding: 4px; } .send-state button { margin-left: 8px; text-decoration: underline; }
         </style>
     </head>
@@ -230,7 +234,7 @@
         </div>
 
         <script src="/static/chat-core.js"></script>
-<script src="/static/main.js?v=wallpaper-actions-2" defer></script>
+<script src="/static/main.js?v=sent-check-1" defer></script>
 
         <div id="settings-modal" class="fixed inset-0 z-[10000] hidden">
             <div class="absolute inset-0 bg-black/40" id="settings-mask"></div>
