@@ -24,7 +24,9 @@ python3 -m venv .venv
 pip install -r requirements.txt
 # Linux x86_64 / Python3.12 可改用带哈希锁：
 # pip install --require-hashes -r requirements-linux-x86_64.lock
-export WEB_PASSWORD='请设置自己的强密码'
+# 留空 WEB_PASSWORD 可改为首次打开网页设置账号密码；此时需设置一次性 SETUP_TOKEN。
+export WEB_PASSWORD=''
+export SETUP_TOKEN='一次性初始化口令'
 export NAPCAT_ACCESS_TOKEN='请设置独立连接令牌'
 export PUBLIC_BASE_URL='https://你的域名'
 export CHAT_DATA_DIR='/你自己的私有数据目录'
@@ -34,11 +36,39 @@ export ADMIN_QQ_ID=''
 python server.py
 ```
 
-`PUBLIC_BASE_URL` 是 NapCat 获取附件时使用的本站公开地址，不可填别人的站点；不要依赖客户端提交的 Host 头生成文件地址。反代必须覆盖转发头并支持 WebSocket，参见 [部署与运维](OPERATIONS.md)。不配置可信代理时不会信任其 X-Forwarded-Proto/For，可能以不安全传输拒绝认证，这是防伪造措施，不应通过“信任所有IP”绕过。
+`PUBLIC_BASE_URL` 是 NapCat 获取附件时使用的本站公开地址，不可填别人的站点；不要依赖客户端提交的 Host 头生成文件地址。直接运行且未设置 `SETUP_TOKEN` 时，服务会在数据目录生成 `setup-token`，可用其中的口令打开 `/web?setup=...` 完成首次设置。反代必须覆盖转发头并支持 WebSocket，参见 [部署与运维](OPERATIONS.md)。不配置可信代理时不会信任其 X-Forwarded-Proto/For，可能以不安全传输拒绝认证，这是防伪造措施，不应通过“信任所有IP”绕过。
 
 NapCat 反向 WebSocket 连接 `/ws` 或 `/`，连接令牌支持 Bearer 头及兼容的 `access_token` 参数。不要在访问日志保存令牌。普通根路径 GET 不是聊天主页。
 
-容器可复制 `.env.example` 到 `.env` 后填写，再执行 `docker compose up -d --build`。默认仅在宿主回环地址公开4001、非root运行、只读根文件系统，数据使用命名卷 `webchat-data`。不要用 `down -v` 清理线上数据。完整部署说明和恢复流程见 [OPERATIONS.md](OPERATIONS.md)，安全边界见 [SECURITY.md](SECURITY.md)。
+## Docker 一键部署（推荐）
+
+宿主机只需要 Docker 和 Compose v2，无需预装 Python/Node：
+
+```sh
+git clone https://github.com/ljy2231/QQ-web-chat.git
+cd QQ-web-chat
+bash deploy/oneclick.sh
+```
+
+脚本全程无交互：自动生成 `.env` 和 NapCat 连接令牌、构建并启动容器、等待健康检查，最后输出一次性初始化链接：
+
+```text
+http://127.0.0.1:4001/web?setup=<一次性口令>
+```
+
+打开链接后设置登录账号和密码，提交即自动登录；链接随后失效。Web 登录密码不会进入环境变量或源码，只以 SHA-256 哈希保存在数据卷的 `credentials.json`（0600）。NapCat 仍需使用 `.env` 中的 `NAPCAT_ACCESS_TOKEN`；脚本不会修改 NapCat 配置。
+
+默认仅监听 `127.0.0.1:4001`，`PUBLIC_BASE_URL` 默认 `http://127.0.0.1:4001`（便于本机发送附件）。通过局域网或公网域名访问时，请配置 HTTPS 反向代理，并在 `.env` 设置 `PUBLIC_BASE_URL=https://你的域名` 和实际的 `TRUSTED_PROXIES`；`WEBCHAT_PORT` / `WEBCHAT_BIND` 可改端口和监听地址。容器默认非root、只读根文件系统、独立命名卷 `webchat-data`，不要用 `down -v` 清理线上数据。
+
+也可以手动部署：复制 `.env.example` 到 `.env` 后填写，再执行 `docker compose up -d --build`。完整部署说明和恢复流程见 [OPERATIONS.md](OPERATIONS.md)，安全边界见 [SECURITY.md](SECURITY.md)。
+
+已构建的镜像发布在 GitHub Container Registry（`main` 分支和 `v*` 标签由 Actions 自动构建）：
+
+```sh
+docker pull ghcr.io/ljy2231/qq-web-chat:latest
+```
+
+使用镜像部署时仍需要 `.env`（至少 `NAPCAT_ACCESS_TOKEN`、`SETUP_TOKEN`），然后执行 `docker compose pull && docker compose up -d --no-build`。镜像默认非root、只读根文件系统；数据必须挂载到 `/data`。
 
 ## 消息与权限规则
 

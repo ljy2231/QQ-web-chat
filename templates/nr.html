@@ -84,10 +84,11 @@ button:disabled{opacity:.5;} .message-segment{margin:2px 0;}
 <div id="login">
   <div class="box">
     <h2>安全验证</h2>
+    <input id="nrUser" type="text" value="admin" autocomplete="username" placeholder="账号" style="margin-bottom:8px">
     <input id="pwd" type="password" placeholder="请输入访问密码">
     <button type="button" id="loginBtn">进入聊天</button>
     <div class="err" id="loginErr"></div>
-    <div style="color:#bbb;font-size:11px;margin-top:6px">NR v8 · WebSocket 兼容版</div>
+    <div style="color:#bbb;font-size:11px;margin-top:6px">NR v9 · WebSocket 兼容版</div>
     <button type="button" id="retryLogout">重试注销</button>
   </div>
 </div>
@@ -125,6 +126,6 @@ button:disabled{opacity:.5;} .message-segment{margin:2px 0;}
   <button type="button" id="nrViewerClose" aria-label="关闭">×</button>
 </div>
 <script src="/static/chat-core.js?v=4"></script>
-<script src="/static/nr.js?v=8" defer></script>
+<script src="/static/nr.js?v=9" defer></script>
 </body>
 </html>

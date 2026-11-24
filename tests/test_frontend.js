@@ -331,4 +331,26 @@ test('main shows one check per published outgoing bubble, not a second confirmed
    else assert.equal(mark,null);
  }
 });
+test('main first-run setup validates, submits once and then logs in with username',()=>{
+ const h=harness('main');
+ h.ctx.location.search='?setup=synthetic-setup-token';
+ assert.equal(h.run('setupTokenFromUrl()'),'synthetic-setup-token');
+ h.run("showSetup(setupTokenFromUrl());setupUser.value='admin';setupPwd.value='short';setupPwd2.value='short';doSetup()");
+ assert.ok(h.nodes['setup-error'].textContent.includes('至少 8 位'));
+ h.run("setupPwd.value='synthetic-pass';setupPwd2.value='synthetic-pass';doSetup()");
+ const setup=h.requests[h.requests.length-1];
+ assert.equal(setup.url,'/api/setup');
+ assert.deepEqual(JSON.parse(setup.body),{token:'synthetic-setup-token',username:'admin',password:'synthetic-pass'});
+ setup.respond(200,{ok:true});
+ assert.equal(h.nodes['login-overlay'].style.display,'none');
+ h.run("loginUser.value='admin';loginPwd.value='synthetic-pass';doLogin()");
+ const login=h.requests[h.requests.length-1];
+ assert.deepEqual(JSON.parse(login.body),{username:'admin',password:'synthetic-pass'});
+});
+test('NR sends the configured username when logging in',()=>{
+ const h=harness('nr');
+ h.run("$('nrUser').value='admin';$('pwd').value='synthetic-pass';doLogin()");
+ const login=h.requests[h.requests.length-1];
+ assert.deepEqual(JSON.parse(login.body),{username:'admin',password:'synthetic-pass'});
+});
 console.log('PASS '+count+' synthetic frontend tests (no browser/device assertions)');

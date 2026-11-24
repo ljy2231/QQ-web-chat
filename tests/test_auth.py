@@ -4,7 +4,9 @@ import hashlib
 import io
 import json
 import logging
+import os
 import socket
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -12,9 +14,9 @@ import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
-from webchat.auth import (COOKIE_NAME, LoginRateLimiter, SafeAccessLogger,
+from webchat.auth import (COOKIE_NAME, CredentialStore, LoginRateLimiter, SafeAccessLogger,
                           SessionManager, json_object, load_credentials,
-                          validate_client_message)
+                          make_setup_handler, validate_client_message)
 
 PASSWORD = "synthetic-test-only-password"
 
@@ -35,10 +37,12 @@ class UnitTests(unittest.TestCase):
         self.assertNotIn(PASSWORD, repr(config))
         self.assertNotIn(env["NAPCAT_ACCESS_TOKEN"], repr(config))
         self.assertEqual(len(config.trusted_proxies), 2)
-        for changed in ({"WEB_PASSWORD": ""}, {"NAPCAT_ACCESS_TOKEN": ""},
+        self.assertEqual(load_credentials({**env, "WEB_PASSWORD": ""}).password, "")
+        for changed in ({"NAPCAT_ACCESS_TOKEN": ""},
                         {"PUBLIC_BASE_URL": "http://chat.example.test"},
                         {"PUBLIC_BASE_URL": "https://chat.example.test/path"},
-                        {"TRUSTED_PROXIES": "invalid"}, {"ADMIN_QQ_ID": "nonnumeric"}):
+                        {"TRUSTED_PROXIES": "invalid"}, {"ADMIN_QQ_ID": "nonnumeric"},
+                        {"WEB_USERNAME": "bad name"}):
             with self.assertRaises(ValueError):
                 load_credentials({**env, **changed})
 
@@ -377,6 +381,101 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(value, text)
         self.assertIn("GET /protected 401", text)
         self.assertIn("<unmatched>", text)
+
+
+class CredentialStoreTests(unittest.TestCase):
+    def test_atomic_roundtrip_and_owner_only_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "credentials.json")
+            store = CredentialStore(path)
+            self.assertIsNone(store.load())
+            stored = store.save("admin", "synthetic-pass-123")
+            self.assertEqual(stored.username, "admin")
+            self.assertRegex(stored.password_hash, r"^[0-9a-f]{64}$")
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            loaded = store.load()
+            self.assertEqual((loaded.username, loaded.password_hash),
+                             (stored.username, stored.password_hash))
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("not json")
+            with self.assertRaises(ValueError):
+                store.load()
+
+
+class SetupFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = CredentialStore(os.path.join(self.temp.name, "credentials.json"))
+        self.manager = SessionManager(setup_token="synthetic-setup-token",
+                                      global_login_limit=100, per_ip_limit=50)
+        app = web.Application()
+        self.manager.install(app)
+        app.router.add_post("/api/setup", make_setup_handler(self.manager, self.store))
+        self.client = TestClient(TestServer(app), cookie_jar=aiohttp.CookieJar(unsafe=True))
+        await self.client.start_server()
+        self.origin = str(self.client.make_url("/")).rstrip("/")
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.temp.cleanup()
+
+    async def test_setup_creates_account_then_normal_login_is_username_bound(self):
+        response = await self.client.get("/api/session")
+        self.assertEqual(response.status, 401)
+        body = await response.json()
+        self.assertTrue(body["setup_required"])
+        response = await self.client.post("/api/setup", json={"token": "wrong", "username": "admin",
+                                                              "password": "synthetic-pass-123"},
+                                          headers={"Origin": self.origin})
+        self.assertEqual(response.status, 403)
+        response = await self.client.post("/api/setup", json={"token": "synthetic-setup-token",
+                                                              "username": "admin", "password": "short"},
+                                          headers={"Origin": self.origin})
+        self.assertEqual(response.status, 400)
+        response = await self.client.post("/api/setup", json={"token": "synthetic-setup-token",
+                                                              "username": "admin",
+                                                              "password": "synthetic-pass-123"},
+                                          headers={"Origin": self.origin})
+        self.assertEqual(response.status, 200)
+        self.assertIn(COOKIE_NAME, response.cookies)
+        self.assertTrue(self.manager.initialized)
+        body = await (await self.client.get("/api/session")).json()
+        self.assertTrue(body["authenticated"])
+        response = await self.client.post("/api/setup", json={"token": "synthetic-setup-token",
+                                                              "username": "other",
+                                                              "password": "synthetic-pass-456"},
+                                          headers={"Origin": self.origin})
+        self.assertEqual(response.status, 409)
+        stored = self.store.load()
+        self.assertEqual(stored.username, "admin")
+        await self.client.post("/api/logout", json={}, headers={"Origin": self.origin})
+        response = await self.client.post("/api/login", json={"username": "admin",
+                                                              "password": "synthetic-pass-123"},
+                                          headers={"Origin": self.origin})
+        self.assertEqual(response.status, 200)
+        response = await self.client.post("/api/login", json={"username": "other",
+                                                              "password": "synthetic-pass-123"},
+                                          headers={"Origin": self.origin})
+        self.assertEqual(response.status, 401)
+        response = await self.client.post("/api/login", json={"password": "synthetic-pass-123"},
+                                          headers={"Origin": self.origin})
+        self.assertEqual(response.status, 401)
+
+    async def test_setup_without_configured_token_is_rejected(self):
+        manager = SessionManager()
+        store = CredentialStore(os.path.join(self.temp.name, "other.json"))
+        app = web.Application()
+        app.router.add_post("/api/setup", make_setup_handler(manager, store))
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/api/setup", json={"token": "anything", "username": "admin",
+                                                             "password": "synthetic-pass-123"},
+                                         headers={"Origin": str(client.make_url("/")).rstrip("/")})
+            self.assertEqual(response.status, 403)
+            self.assertFalse(manager.initialized)
+        finally:
+            await client.close()
 
 
 if __name__ == "__main__":

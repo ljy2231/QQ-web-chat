@@ -9,7 +9,7 @@ let ws = null;
 
             let authToken = null; // Session-generation marker only; never a bearer credential.
             let store = new ChatCore.Store();
-            let connection = null, historyTimer = null, sessionRequest = null;
+            let connection = null, historyTimer = null, sessionRequest = null, setupRequest = null;
             let previewBlobURL = null, composing = false;
             try { localStorage.removeItem('webchat_token'); } catch (e) {}
 
@@ -35,7 +35,16 @@ let ws = null;
             let countdownInterval = null;
 
             const loginOverlay = document.getElementById('login-overlay');
+            const loginCard = document.getElementById('login-card');
+            const loginUser = document.getElementById('login-user');
             const loginPwd = document.getElementById('login-pwd');
+            const setupCard = document.getElementById('setup-card');
+            const setupUser = document.getElementById('setup-user');
+            const setupPwd = document.getElementById('setup-pwd');
+            const setupPwd2 = document.getElementById('setup-pwd2');
+            const setupToken = document.getElementById('setup-token');
+            const setupBtn = document.getElementById('setup-btn');
+            const setupError = document.getElementById('setup-error');
             const loginBtn = document.getElementById('login-btn');
             const loginError = document.getElementById('login-error');
             const logoutBtn = document.getElementById('logout-btn');
@@ -506,8 +515,58 @@ let ws = null;
             function enterSession() {
                 authToken = ChatCore.id();
                 loginPwd.value = ''; loginError.classList.add('hidden');
+                if (setupCard) setupCard.classList.add('hidden');
                 loginOverlay.style.display = 'none'; updateWallpaperView();
                 resetSettingsCache(); loadSettings(); connect();
+            }
+            function setupTokenFromUrl() {
+                const search = (window.location && window.location.search) || '';
+                const match = /(?:^|[?&])setup=([^&]+)/.exec(search);
+                if (!match) return '';
+                try { return decodeURIComponent(match[1]); } catch (e) { return ''; }
+            }
+            function clearSetupQuery() {
+                if (!window.history || !window.history.replaceState || !window.location) return;
+                try { window.history.replaceState(null, '', window.location.pathname); } catch (e) {}
+            }
+            function showLogin() {
+                if (setupCard) setupCard.classList.add('hidden');
+                if (loginCard) loginCard.classList.remove('hidden');
+            }
+            function showSetup(token) {
+                if (loginCard) loginCard.classList.add('hidden');
+                if (!setupCard) return;
+                setupCard.classList.remove('hidden');
+                if (setupUser) setupUser.value = 'admin';
+                if (setupPwd) setupPwd.value = '';
+                if (setupPwd2) setupPwd2.value = '';
+                if (setupToken) setupToken.value = token || '';
+                if (setupError) setupError.classList.add('hidden');
+                if (setupBtn) { setupBtn.disabled = false; setupBtn.innerText = '创建账号并进入'; }
+            }
+            function setupFailure(text) {
+                if (!setupError) { showToast(text); return; }
+                setupError.innerText = text; setupError.classList.remove('hidden');
+            }
+            function doSetup() {
+                const username = (setupUser && setupUser.value || '').trim();
+                const password = (setupPwd && setupPwd.value) || '';
+                const token = (setupToken && setupToken.value || '').trim();
+                if (!token) { setupFailure('缺少初始化口令，请使用部署脚本输出的一次性链接'); return; }
+                if (!/^[A-Za-z0-9_.-]{3,32}$/.test(username)) { setupFailure('账号需为 3-32 位字母、数字、点、下划线或短横线'); return; }
+                if (password.length < 8) { setupFailure('密码至少 8 位'); return; }
+                if (password !== (setupPwd2 && setupPwd2.value || '')) { setupFailure('两次输入的密码不一致'); return; }
+                if (setupRequest) { setupRequest.abort(); setupRequest = null; }
+                if (setupBtn) { setupBtn.disabled = true; setupBtn.innerText = '创建中...'; }
+                setupRequest = ChatCore.request('POST', '/api/setup', {token: token, username: username, password: password}, function(status, data) {
+                    setupRequest = null;
+                    if (setupBtn) { setupBtn.disabled = false; setupBtn.innerText = '创建账号并进入'; }
+                    if (status === 200) { clearSetupQuery(); enterSession(); return; }
+                    if (status === 409) { showLogin(); loginError.classList.remove('hidden'); loginError.innerText = '已完成初始化，请直接登录'; return; }
+                    if (status === 403) { setupFailure('初始化口令不正确或已失效'); return; }
+                    if (status === 400 && data && data.error) { setupFailure(data.error); return; }
+                    setupFailure(status === 0 ? '创建超时或网络异常，请重试' : '初始化失败，请稍后重试');
+                });
             }
             function doLogin() {
                 if (!loginPwd.value) { showToast('请输入密码'); return; }
@@ -515,11 +574,13 @@ let ws = null;
                 const marker = ChatCore.id(); loginBtn.dataset.request = marker;
                 if (sessionRequest) { sessionRequest.abort(); sessionRequest = null; }
                 loginBtn.disabled = true; loginBtn.innerText = '验证中...';
-                sessionRequest = ChatCore.request('POST', '/api/login', {password: loginPwd.value}, function(status, data) {
+                const username = (loginUser && loginUser.value || '').trim();
+                sessionRequest = ChatCore.request('POST', '/api/login', {username: username, password: loginPwd.value}, function(status, data) {
                     if (loginBtn.dataset.request !== marker) return;
                     sessionRequest = null; loginBtn.disabled = false; loginBtn.innerText = '登录';
                     if (status === 200) enterSession();
-                    else { loginError.classList.remove('hidden'); loginError.innerText = status === 0 ? '登录超时或网络错误，请重试' : '登录失败，请检查密码或稍后重试'; }
+                    else if (status === 409 && data && data.setup_required) { showSetup(setupTokenFromUrl()); }
+                    else { loginError.classList.remove('hidden'); loginError.innerText = status === 0 ? '登录超时或网络错误，请重试' : '登录失败，请检查账号密码或稍后重试'; }
                 });
             }
             function clearSession(message, preserveLookups) {
@@ -534,6 +595,7 @@ let ws = null;
                 contactList.innerHTML = ''; messageArea.innerHTML = ''; inputBox.value = '';
                 currentChatName.innerText = '请选择联系人';
                 loginPwd.value = ''; loginBtn.disabled = false; loginBtn.innerText = '登录';
+                showLogin();
                 loginOverlay.style.display = 'flex'; updateWallpaperView();
                 loginError.innerText = message || ''; loginError.classList.toggle('hidden', !message);
                 const card = document.getElementById('login-card');
@@ -565,6 +627,11 @@ let ws = null;
             if (saveWallpaperBtn) saveWallpaperBtn.addEventListener('click', saveCurrentWallpaper);
             if (downloadBgBtn) downloadBgBtn.addEventListener('click', saveCurrentWallpaper);
             loginBtn.addEventListener('click', doLogin);
+            if (setupBtn) setupBtn.addEventListener('click', doSetup);
+            [setupUser, setupPwd, setupPwd2, setupToken].forEach(function(input) {
+                if (!input) return;
+                input.addEventListener('keydown', function(e) { if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) doSetup(); });
+            });
             loginPwd.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) doLogin(); });
 
             function restoreSession() {
@@ -573,6 +640,7 @@ let ws = null;
                     if (loginBtn.dataset.request !== marker) return;
                     sessionRequest = null;
                     if (status === 200 && data && data.authenticated) enterSession();
+                    else if (status === 401 && data && data.setup_required) showSetup(setupTokenFromUrl());
                     else if (status === 0) { loginError.classList.remove('hidden'); loginError.innerText = '会话检查超时，请重新登录'; }
                 });
             }

@@ -2,7 +2,7 @@
 var session = null, connection = null, myQQ = null, contacts = {}, currentId = null, currentType = null;
 var pendingFile = null, currentXHR = null, quoteMsg = null, store = new ChatCore.Store();
 var composing = false, historyTimer = null, sessionRequest = null, sessionGeneration = 0, logoutGeneration = 0, logoutPending = false;
-var NR_BUILD = 'NR v8';
+var NR_BUILD = 'NR v9';
 var nrView = {open: false, scale: 1, tx: 0, ty: 0}, nrDrag = null, NR_MIN_SCALE = 1, NR_MAX_SCALE = 5, NR_ZOOM_STEP = 1.35;
 var nrStick = true;
 var wsToken = null;
@@ -31,7 +31,7 @@ function doLogin() {
     sessionGeneration += 1; var generation = sessionGeneration;
     if (sessionRequest) sessionRequest.abort();
     $('loginBtn').disabled = true; $('loginErr').textContent = '验证中…';
-    sessionRequest = ChatCore.request('POST', '/api/login', {password: $('pwd').value}, function(status, data) {
+    sessionRequest = ChatCore.request('POST', '/api/login', {username: $('nrUser').value, password: $('pwd').value}, function(status, data) {
         if (generation !== sessionGeneration) return;
         sessionRequest = null; $('loginBtn').disabled = false;
         if (status === 200) {
@@ -370,6 +370,7 @@ try { localStorage.removeItem('webchat_token'); } catch (ignore) {}
             if (data.ws_token) { wsToken = data.ws_token; try { window.sessionStorage.setItem('nr_ws_token', wsToken); } catch (ignore) {} }
             enterSession();
         }
+        else if (status === 401 && data && data.setup_required) $('loginErr').textContent = '请先在主站 /web 完成初始化设置';
         else if (status === 0) $('loginErr').textContent = '会话检查超时，请重新登录';
     });
 }());

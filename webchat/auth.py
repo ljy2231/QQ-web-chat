@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import secrets
+import tempfile
 import time
 from typing import Mapping
 from urllib.parse import urlsplit
@@ -130,6 +131,9 @@ def _loopback(host):
         return False
 
 
+USERNAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]{3,32}")
+
+
 @dataclass(frozen=True)
 class Credentials:
     password: str = field(repr=False)
@@ -137,16 +141,29 @@ class Credentials:
     admin_qq_id: str = ""
     public_base_url: str = ""
     trusted_proxies: tuple = ()
+    username: str = ""
+
+
+def validate_new_password(password):
+    if not isinstance(password, str) or not 8 <= len(password) <= 128:
+        raise ValueError("password must be 8-128 characters")
 
 
 def load_credentials(env: Mapping | None = None):
-    """Load environment only; never load a repository .env or disclose values."""
+    """Load environment only; never load a repository .env or disclose values.
+
+    An empty WEB_PASSWORD is allowed for a fresh install: the web UI then asks
+    the first visitor to create an account, guarded by SETUP_TOKEN.
+    """
     env = os.environ if env is None else env
     password, token = env.get("WEB_PASSWORD", ""), env.get("NAPCAT_ACCESS_TOKEN", "")
-    if not isinstance(password, str) or not password.strip() or len(password) > 4096:
-        raise ValueError("WEB_PASSWORD must be a nonempty bounded string")
+    if not isinstance(password, str) or len(password) > 4096 or (password and not password.strip()):
+        raise ValueError("WEB_PASSWORD must be empty or a bounded string")
     if not isinstance(token, str) or not token.strip() or len(token) > 4096:
         raise ValueError("NAPCAT_ACCESS_TOKEN must be a nonempty bounded string")
+    username = env.get("WEB_USERNAME", "")
+    if username and not USERNAME_PATTERN.fullmatch(username):
+        raise ValueError("WEB_USERNAME must be 3-32 letters, digits, dot, dash or underscore")
     admin = env.get("ADMIN_QQ_ID", "")
     if admin and not re.fullmatch(r"[1-9][0-9]{0,19}", admin):
         raise ValueError("ADMIN_QQ_ID must be a numeric identifier")
@@ -158,7 +175,71 @@ def load_credentials(env: Mapping | None = None):
     proxies = tuple(x.strip() for x in env.get("TRUSTED_PROXIES", "").split(",") if x.strip())
     for proxy in proxies:
         ipaddress.ip_network(proxy, strict=False)
-    return Credentials(password, token, admin, public, proxies)
+    return Credentials(password, token, admin, public, proxies, username)
+
+
+@dataclass(frozen=True)
+class StoredCredentials:
+    username: str
+    password_hash: str
+    created_at: float
+
+
+class CredentialStore:
+    """Atomic owner-only credential file; plaintext passwords are never stored."""
+
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+
+    def load(self):
+        try:
+            with open(self.path, "rb") as handle:
+                raw = handle.read(8192)
+        except FileNotFoundError:
+            return None
+        try:
+            data = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            raise ValueError("credential file is invalid") from None
+        if not isinstance(data, dict) or data.get("version") != 1:
+            raise ValueError("credential file is invalid")
+        username, digest, created = data.get("username"), data.get("password_hash"), data.get("created_at")
+        if not isinstance(username, str) or not USERNAME_PATTERN.fullmatch(username):
+            raise ValueError("credential file is invalid")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("credential file is invalid")
+        if not isinstance(created, (int, float)) or isinstance(created, bool) or created <= 0:
+            raise ValueError("credential file is invalid")
+        return StoredCredentials(username, digest, float(created))
+
+    def save(self, username, password):
+        if not USERNAME_PATTERN.fullmatch(username or ""):
+            raise ValueError("invalid username")
+        digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        payload = json.dumps({"version": 1, "username": username, "password_hash": digest,
+                              "created_at": time.time()}).encode("utf-8")
+        directory = os.path.dirname(self.path)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".credentials-", dir=directory)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+        return StoredCredentials(username, digest, time.time())
 
 
 @dataclass(eq=False)
@@ -207,16 +288,24 @@ class LoginRateLimiter:
 
 
 class SessionManager:
-    def __init__(self, password, *, public_base_url="", trusted_proxies=(),
+    def __init__(self, password="", *, username="", password_hash=None, setup_token="",
+                 public_base_url="", trusted_proxies=(),
                  absolute_ttl=86400, idle_ttl=3600, max_sessions=128,
                  max_resources_per_session=16, per_ip_limit=10, global_login_limit=60,
                  login_window=60, max_login_ips=1024, sweep_interval=1,
                  close_timeout=2, allow_password_hash=False, clock=time.monotonic):
-        if not isinstance(password, str) or not password.strip() or len(password) > 4096:
-            raise ValueError("nonempty bounded password required")
+        if password and (not isinstance(password, str) or not password.strip() or len(password) > 4096):
+            raise ValueError("bounded password required")
+        if username and not USERNAME_PATTERN.fullmatch(username):
+            raise ValueError("invalid username")
+        if password_hash is not None and (not isinstance(password_hash, str) or
+                                          not re.fullmatch(r"[0-9a-f]{64}", password_hash)):
+            raise ValueError("invalid password hash")
         if min(absolute_ttl, idle_ttl, max_sessions, max_resources_per_session, sweep_interval, close_timeout) <= 0:
             raise ValueError("session limits must be positive")
-        self._password_hash = hashlib.sha256(password.encode()).hexdigest()
+        self._password_hash = password_hash or (hashlib.sha256(password.encode()).hexdigest() if password else None)
+        self.username = username or ""
+        self.setup_token = setup_token or ""
         self.public_base_url = public_base_url.rstrip("/")
         self.public_origin = _origin(public_base_url) if public_base_url else None
         if self.public_origin and self.public_origin[0] != "https" and not _loopback(self.public_origin[1]):
@@ -228,6 +317,25 @@ class SessionManager:
         self.allow_password_hash, self.clock = allow_password_hash, clock
         self.sessions = {}
         self.limiter = LoginRateLimiter(per_ip_limit, global_login_limit, login_window, max_login_ips, clock)
+
+    @property
+    def initialized(self):
+        return self._password_hash is not None
+
+    def verify_setup_token(self, token):
+        return bool(self.setup_token and isinstance(token, str) and
+                    secrets.compare_digest(token, self.setup_token))
+
+    def set_credentials(self, username, *, password=None, password_hash=None):
+        if not USERNAME_PATTERN.fullmatch(username or ""):
+            raise ValueError("invalid username")
+        if password_hash is None:
+            validate_new_password(password)
+            password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        elif not re.fullmatch(r"[0-9a-f]{64}", password_hash or ""):
+            raise ValueError("invalid password hash")
+        self.username = username
+        self._password_hash = password_hash
 
     def _trusted(self, value):
         try:
@@ -397,13 +505,19 @@ class SessionManager:
             response = web.json_response({"error": "too many login attempts"}, status=429)
             response.headers.update({"Retry-After": str(int(self.limiter.window) + 1), "Cache-Control": "no-store"})
             return response
+        if not self.initialized:
+            return web.json_response({"status": "error", "error": "setup required",
+                                      "setup_required": True}, status=409,
+                                     headers={"Cache-Control": "no-store"})
         data = await json_object(request, 8192)
+        username = bounded_string(data.get("username"), "username", maximum=64)
         password = bounded_string(data.get("password"), "password", maximum=4096)
         password_hash = bounded_string(data.get("password_hash"), "password_hash", maximum=64)
         digest = hashlib.sha256((password or "").encode()).hexdigest()
-        valid = bool(password) and secrets.compare_digest(digest, self._password_hash)
+        allowed = not self.username or (bool(username) and secrets.compare_digest(username, self.username))
+        valid = allowed and bool(password) and secrets.compare_digest(digest, self._password_hash)
         if self.allow_password_hash and password_hash and re.fullmatch(r"[0-9a-f]{64}", password_hash):
-            valid = valid or secrets.compare_digest(password_hash, self._password_hash)
+            valid = allowed and (valid or secrets.compare_digest(password_hash, self._password_hash))
         if not valid:
             return web.json_response({"status": "error", "error": "invalid credentials"}, status=401,
                                      headers={"Cache-Control": "no-store"})
@@ -424,7 +538,8 @@ class SessionManager:
     async def session_handler(self, request):
         session = self.authenticate(request)
         if session is None:
-            return web.json_response({"authenticated": False}, status=401,
+            return web.json_response({"authenticated": False, "setup_required": not self.initialized,
+                                      "username_required": bool(self.username)}, status=401,
                                      headers={"Cache-Control": "no-store"})
         # Old Android WebViews omit cookies on WebSocket upgrades, so an already
         # authenticated same-origin page may use this token for the WS handshake.
@@ -465,6 +580,48 @@ class SessionManager:
         app.router.add_get("/api/session", self.session_handler)
         app.router.add_post("/api/restore", self.restore_handler)
         app.cleanup_ctx.append(self.cleanup_context)
+
+
+def make_setup_handler(manager, store):
+    """One-time web setup, authorised by the deployment's SETUP_TOKEN.
+
+    The handler is only reachable while no credential file exists. It creates
+    the account, persists only a password hash, issues the first session and
+    never exposes the token or the password in responses or logs.
+    """
+    async def setup_handler(request):
+        manager.check_transport(request)
+        manager.check_origin(request, required=True)
+        if not manager.limiter.allow(manager.client_ip(request)):
+            response = web.json_response({"error": "too many setup attempts"}, status=429,
+                                         headers={"Cache-Control": "no-store"})
+            response.headers["Retry-After"] = str(int(manager.limiter.window) + 1)
+            return response
+        if manager.initialized:
+            return web.json_response({"error": "already initialized"}, status=409,
+                                     headers={"Cache-Control": "no-store"})
+        data = await json_object(request, 8192)
+        token = bounded_string(data.get("token"), "token", maximum=256)
+        username = bounded_string(data.get("username"), "username", maximum=64) or "admin"
+        password = bounded_string(data.get("password"), "password", maximum=4096, required=True)
+        if not manager.verify_setup_token(token):
+            return web.json_response({"error": "invalid setup token"}, status=403,
+                                     headers={"Cache-Control": "no-store"})
+        try:
+            validate_new_password(password)
+            stored = store.save(username, password)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400,
+                                     headers={"Cache-Control": "no-store"})
+        except OSError:
+            logging.getLogger(__name__).error("credential storage unavailable")
+            return web.json_response({"error": "credential storage unavailable"}, status=503,
+                                     headers={"Cache-Control": "no-store"})
+        manager.set_credentials(stored.username, password_hash=stored.password_hash)
+        session = await manager.issue()
+        return manager._cookie(web.json_response({"ok": True, "username": stored.username,
+                                                  "token": session.token}), request, session)
+    return setup_handler
 
 
 class SafeAccessLogger(AbstractAccessLogger):

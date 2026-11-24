@@ -37,11 +37,37 @@ SQLite schema3 的行级表是权威数据源。回退到只读取旧 `storage` 
 
 ## 容器
 
+一键部署（无交互）：
+
+```sh
+git clone https://github.com/ljy2231/QQ-web-chat.git
+cd QQ-web-chat
+bash deploy/oneclick.sh
+```
+
+脚本生成 `.env`（0600）、一次性 `SETUP_TOKEN`、NapCat连接令牌，启动后打印带初始化口令的链接；默认回环部署时会把 `PUBLIC_BASE_URL` 设为 `http://127.0.0.1:4001`，便于本机发送附件。首次打开网页设置登录账号和密码；密码只保存为数据卷内 `credentials.json` 的哈希。该链接只能使用一次，初始化完成后失效。不要在初始化完成前把服务暴露到公网。
+
+手动部署：
+
 ```sh
 cp .env.example .env
-# 编辑真实凭据、HTTPS地址与可信代理；不要提交.env。
+# 编辑真实凭据、HTTPS地址与可信代理；WEB_PASSWORD 留空可走网页初始化。
 docker compose up -d --build
 ```
+
+### 首次初始化与重置
+
+- 初始化链接：`http://<地址>:4001/web?setup=<SETUP_TOKEN>`；口令来自 `.env` 的 `SETUP_TOKEN`，或（未配置时）数据卷内 `/data/setup-token`。
+- 初始化完成后再次调用 `/api/setup` 会被拒绝（409）。
+- 忘记账号：停止写入并删除数据卷内 `credentials.json`，再准备新的 `SETUP_TOKEN` 后重启；**不要删除整个数据卷**，否则聊天数据一起丢失。示例：
+
+```sh
+docker compose -p qq-webchat exec webchat rm -f /data/credentials.json
+docker compose -p qq-webchat restart webchat
+```
+
+- 兼容旧部署：设置 `WEB_PASSWORD` 时仍按环境变量密码登录；`credentials.json` 存在时优先使用文件中的账号密码。旧 `WEB_PASSWORD` 不会自动迁移到网页设置，需要重新初始化或继续使用环境变量。
+- 反向代理必须覆盖 `X-Forwarded-Proto` 并配置精确 `TRUSTED_PROXIES`；否则 HTTPS 反代下的登录会被安全传输检查拒绝。`PUBLIC_BASE_URL` 留空时按请求 Host 校验 Origin。
 
 默认UID/GID10001、只读根文件系统、独立命名数据卷、无额外Linux capability、健康检查。不要与现有正式站同时占用4001；镜像测试应随机映射宿主端口。命名数据卷的删除是永久数据破坏，不要使用 `down -v` 清理线上服务。
 

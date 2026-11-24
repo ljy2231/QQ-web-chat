@@ -2,7 +2,8 @@ import asyncio
 import signal
 from pathlib import Path
 from webchat.storage import AsyncStore, RevisionConflict, StorageBusy
-from webchat.auth import SessionManager, SafeAccessLogger, json_object, load_credentials
+from webchat.auth import (SessionManager, SafeAccessLogger, CredentialStore,
+                          json_object, load_credentials, make_setup_handler)
 from webchat.resources import DiskBudget, io_safely
 from webchat.http_security import security_middleware, response_headers
 from webchat.messaging import (conversation_key, parse_target, normalize_segments,
@@ -62,8 +63,17 @@ UPLOAD_DIR = os.path.join(DATA_DIR, "files")
 # 保存有效的登录 Token
 TEMPLATE_DIR = Path(__file__).resolve().parent / 'templates'
 PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', '').rstrip('/')
-sessions = SessionManager(WEB_PASSWORD, public_base_url=PUBLIC_BASE_URL,
-                          trusted_proxies=tuple(x.strip() for x in os.environ.get('TRUSTED_PROXIES', '').split(',') if x.strip()))
+CREDENTIALS_FILE = os.path.join(DATA_DIR, 'credentials.json')
+SETUP_TOKEN_FILE = os.path.join(DATA_DIR, 'setup-token')
+credential_store = CredentialStore(CREDENTIALS_FILE)
+stored_credentials = credential_store.load()
+sessions = SessionManager(
+    '' if stored_credentials else WEB_PASSWORD,
+    username=stored_credentials.username if stored_credentials else os.environ.get('WEB_USERNAME', ''),
+    password_hash=stored_credentials.password_hash if stored_credentials else None,
+    setup_token=os.environ.get('SETUP_TOKEN', ''),
+    public_base_url=PUBLIC_BASE_URL,
+    trusted_proxies=tuple(x.strip() for x in os.environ.get('TRUSTED_PROXIES', '').split(',') if x.strip()))
 store = None
 background_tasks = set()
 shutdown_event = asyncio.Event()
@@ -1493,6 +1503,7 @@ def create_app():
     app.cleanup_ctx.append(application_lifecycle)
     app.on_shutdown.append(shutdown_transports)
     sessions.install(app)
+    app.router.add_post('/api/setup', make_setup_handler(sessions, credential_store))
     app.router.add_get('/healthz', health_handler)
     app.router.add_get('/readyz', ready_handler)
     app.router.add_get('/ws', napcat_ws_handler)
@@ -1515,12 +1526,34 @@ def create_app():
     return app
 
 
+def ensure_setup_token():
+    """Persist a first-run token when neither env nor an existing file provides one."""
+    if sessions.initialized or sessions.setup_token:
+        return
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+    try:
+        with open(SETUP_TOKEN_FILE, 'rb') as handle:
+            token = handle.read(256).decode('utf-8').strip()
+    except FileNotFoundError:
+        token = ''
+    if len(token) < 20:
+        token = secrets.token_urlsafe(32)
+        descriptor = os.open(SETUP_TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            handle.write(token)
+            handle.flush()
+            os.fsync(handle.fileno())
+    sessions.setup_token = token
+    logger.info('首次设置令牌已写入数据目录（setup-token）')
+
+
 async def main():
     load_credentials()
-    if not WEB_PASSWORD or not EXPECTED_TOKEN:
-        raise RuntimeError('请设置 WEB_PASSWORD 和 NAPCAT_ACCESS_TOKEN')
-    if not PUBLIC_BASE_URL.startswith(('http://', 'https://')):
-        raise RuntimeError('请配置 PUBLIC_BASE_URL')
+    if not EXPECTED_TOKEN:
+        raise RuntimeError('请设置 NAPCAT_ACCESS_TOKEN')
+    if PUBLIC_BASE_URL and not PUBLIC_BASE_URL.startswith(('http://', 'https://')):
+        raise RuntimeError('PUBLIC_BASE_URL 必须以 http:// 或 https:// 开头')
+    ensure_setup_token()
     runner = web.AppRunner(create_app(), access_log_class=SafeAccessLogger, shutdown_timeout=DRAIN_TIMEOUT)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
