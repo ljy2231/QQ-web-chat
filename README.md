@@ -6,6 +6,33 @@
 - Python aiohttp + SQLite 行级存储；浏览器使用同源 HttpOnly 会话 Cookie。
 - 本项目不是多租户平台；共享网页密码意味着共享全部聊天与管理权限。
 
+## 快速开始（Docker 一键部署）
+
+一行命令，复制粘贴即可运行。需要 Linux amd64、Docker 与 Compose v2，通常用 root 执行（需要写 `/opt` 和 Docker 的权限）。
+
+国内加速下载（已内置加速站）：
+
+```sh
+curl -fsSL https://hub.002230.xyz:44300/https://raw.githubusercontent.com/ljy2231/QQ-web-chat/main/deploy/install-cn.sh | bash
+```
+
+海外 / 直连 GHCR：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ljy2231/QQ-web-chat/main/deploy/install.sh | bash
+```
+
+脚本会自动生成一次性初始化口令和 NapCat 连接令牌、创建数据目录、拉取镜像并启动容器，最后打印访问地址与首次设置链接。默认安装目录 `/opt/qq-webchat`，端口 `4001`，仅监听 `127.0.0.1`；重复执行会保留 `.env`、数据与令牌，并重新生成 Compose 文件。
+
+打开脚本输出的链接，在网页中设置登录账号和密码即可（命令行不需要输入账号密码）。NapCat 需要使用 `.env` 中的 `NAPCAT_ACCESS_TOKEN`；脚本不会修改 NapCat。
+
+默认只能从本机访问；公网使用请配置 HTTPS 反向代理，并覆盖监听地址和公开地址：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ljy2231/QQ-web-chat/main/deploy/install.sh | \
+  QQWEBCHAT_BIND=0.0.0.0 PUBLIC_BASE_URL=https://chat.example.com TRUSTED_PROXIES=127.0.0.1/32 bash
+```
+
 ## 在线演示
 
 纯静态界面演示，不需要后端，也不连接 QQ；演示密码 `admin`。
@@ -14,7 +41,7 @@
 
 源码：[QQ-Web-Chat-Demo](https://github.com/ljy2231/QQ-Web-Chat-Demo)
 
-## 快速运行
+## 源码运行（Python）
 
 需要 Python **3.12**、NapCat 或 任何支持WS的QQbot框架，以及生产环境 HTTPS 反向代理。
 
@@ -40,35 +67,20 @@ python server.py
 
 NapCat 反向 WebSocket 连接 `/ws` 或 `/`，连接令牌支持 Bearer 头及兼容的 `access_token` 参数。不要在访问日志保存令牌。普通根路径 GET 不是聊天主页。
 
-## Docker 一键部署（推荐）
+## Docker 部署细节
 
-宿主机只需要 Docker 和 Compose v2，无需预装 Python/Node：
-
-```sh
-git clone https://github.com/ljy2231/QQ-web-chat.git
-cd QQ-web-chat
-bash deploy/oneclick.sh
-```
-
-脚本全程无交互：自动生成 `.env` 和 NapCat 连接令牌、构建并启动容器、等待健康检查，最后输出一次性初始化链接：
-
-```text
-http://127.0.0.1:4001/web?setup=<一次性口令>
-```
-
-打开链接后设置登录账号和密码，提交即自动登录；链接随后失效。Web 登录密码不会进入环境变量或源码，只以 SHA-256 哈希保存在数据卷的 `credentials.json`（0600）。NapCat 仍需使用 `.env` 中的 `NAPCAT_ACCESS_TOKEN`；脚本不会修改 NapCat 配置。
-
-默认仅监听 `127.0.0.1:4001`，`PUBLIC_BASE_URL` 默认 `http://127.0.0.1:4001`（便于本机发送附件）。通过局域网或公网域名访问时，请配置 HTTPS 反向代理，并在 `.env` 设置 `PUBLIC_BASE_URL=https://你的域名` 和实际的 `TRUSTED_PROXIES`；`WEBCHAT_PORT` / `WEBCHAT_BIND` 可改端口和监听地址。容器默认非root、只读根文件系统、独立命名卷 `webchat-data`，不要用 `down -v` 清理线上数据。
-
-也可以手动部署：复制 `.env.example` 到 `.env` 后填写，再执行 `docker compose up -d --build`。完整部署说明和恢复流程见 [OPERATIONS.md](OPERATIONS.md)，安全边界见 [SECURITY.md](SECURITY.md)。
-
-已构建的镜像发布在 GitHub Container Registry（`main` 分支和 `v*` 标签由 Actions 自动构建）：
+- 安装目录：`/opt/qq-webchat`；配置在 `.env`（权限 600），聊天数据/附件在 `data/`。
+- 端口与监听：`QQWEBCHAT_PORT`（默认 4001）、`QQWEBCHAT_BIND`（默认 `127.0.0.1`）。
+- 其他覆盖：`QQWEBCHAT_DIR`、`QQWEBCHAT_IMAGE`、`QQWEBCHAT_MIRROR`、`QQWEBCHAT_SETUP_TOKEN`、`NAPCAT_ACCESS_TOKEN`、`PUBLIC_BASE_URL`、`TRUSTED_PROXIES`。
+- 重复执行会保留 `.env`、数据和令牌，并重新生成 `compose.yaml`；不会覆盖已设置的网页账号密码。
+- 首次设置链接只能使用一次；忘记账号密码的恢复方式见 [OPERATIONS.md](OPERATIONS.md)。
+- 已构建镜像发布在 GitHub Container Registry（`main` 分支和 `v*` 标签由 Actions 自动构建）：
 
 ```sh
 docker pull ghcr.io/ljy2231/qq-web-chat:latest
 ```
 
-使用镜像部署时仍需要 `.env`（至少 `NAPCAT_ACCESS_TOKEN`、`SETUP_TOKEN`），然后执行 `docker compose pull && docker compose up -d --no-build`。镜像默认非root、只读根文件系统；数据必须挂载到 `/data`。
+国内加速镜像使用前缀 `hub.002230.xyz:44300/`。手动部署可复制 `.env.example` 到 `.env` 后执行 `docker compose up -d --build`；镜像默认非root、只读根文件系统，数据必须挂载到 `/data`。
 
 ## 消息与权限规则
 

@@ -37,17 +37,17 @@ SQLite schema3 的行级表是权威数据源。回退到只读取旧 `storage` 
 
 ## 容器
 
-一键部署（无交互）：
+一键部署（无交互，支持国内加速）：
 
 ```sh
-git clone https://github.com/ljy2231/QQ-web-chat.git
-cd QQ-web-chat
-bash deploy/oneclick.sh
+curl -fsSL https://raw.githubusercontent.com/ljy2231/QQ-web-chat/main/deploy/install.sh | bash
+# 国内加速：
+curl -fsSL https://hub.002230.xyz:44300/https://raw.githubusercontent.com/ljy2231/QQ-web-chat/main/deploy/install-cn.sh | bash
 ```
 
-脚本生成 `.env`（0600）、一次性 `SETUP_TOKEN`、NapCat连接令牌，启动后打印带初始化口令的链接；默认回环部署时会把 `PUBLIC_BASE_URL` 设为 `http://127.0.0.1:4001`，便于本机发送附件。首次打开网页设置登录账号和密码；密码只保存为数据卷内 `credentials.json` 的哈希。该链接只能使用一次，初始化完成后失效。不要在初始化完成前把服务暴露到公网。
+默认安装到 `/opt/qq-webchat`，数据在 `/opt/qq-webchat/data`，配置在 `.env`（0600）。脚本生成一次性 `SETUP_TOKEN` 与 NapCat 连接令牌，拉取镜像并启动，最后打印初始化链接。默认仅监听 `127.0.0.1:4001`；重复执行保留数据和令牌并重建 `compose.yaml`。可用 `QQWEBCHAT_DIR`、`QQWEBCHAT_PORT`、`QQWEBCHAT_BIND`、`PUBLIC_BASE_URL`、`TRUSTED_PROXIES` 覆盖。首次打开网页设置登录账号和密码，密码只保存为 `data/credentials.json` 的哈希；该链接只能使用一次。不要在初始化完成前把服务暴露到公网。
 
-手动部署：
+手动部署（源码）：
 
 ```sh
 cp .env.example .env
@@ -57,19 +57,20 @@ docker compose up -d --build
 
 ### 首次初始化与重置
 
-- 初始化链接：`http://<地址>:4001/web?setup=<SETUP_TOKEN>`；口令来自 `.env` 的 `SETUP_TOKEN`，或（未配置时）数据卷内 `/data/setup-token`。
+- 初始化链接：`http://<地址>:4001/web?setup=<SETUP_TOKEN>`；口令在 `/opt/qq-webchat/.env` 的 `SETUP_TOKEN`，或数据目录的 `setup-token`。
 - 初始化完成后再次调用 `/api/setup` 会被拒绝（409）。
-- 忘记账号：停止写入并删除数据卷内 `credentials.json`，再准备新的 `SETUP_TOKEN` 后重启；**不要删除整个数据卷**，否则聊天数据一起丢失。示例：
+- 忘记账号：删除数据目录中的 `credentials.json` 后重启；**不要删除 data 目录**，否则聊天数据一起丢失。示例：
 
 ```sh
-docker compose -p qq-webchat exec webchat rm -f /data/credentials.json
-docker compose -p qq-webchat restart webchat
+docker compose -f /opt/qq-webchat/compose.yaml -p qq-webchat stop
+rm -f /opt/qq-webchat/data/credentials.json
+docker compose -f /opt/qq-webchat/compose.yaml -p qq-webchat up -d
 ```
 
 - 兼容旧部署：设置 `WEB_PASSWORD` 时仍按环境变量密码登录；`credentials.json` 存在时优先使用文件中的账号密码。旧 `WEB_PASSWORD` 不会自动迁移到网页设置，需要重新初始化或继续使用环境变量。
 - 反向代理必须覆盖 `X-Forwarded-Proto` 并配置精确 `TRUSTED_PROXIES`；否则 HTTPS 反代下的登录会被安全传输检查拒绝。`PUBLIC_BASE_URL` 留空时按请求 Host 校验 Origin。
 
-默认UID/GID10001、只读根文件系统、独立命名数据卷、无额外Linux capability、健康检查。不要与现有正式站同时占用4001；镜像测试应随机映射宿主端口。命名数据卷的删除是永久数据破坏，不要使用 `down -v` 清理线上服务。
+容器使用 UID/GID 10001、只读根文件系统、无额外 Linux capability 和健康检查；安装器使用 `./data` 绑定目录，手动 Compose 使用命名卷 `webchat-data`。不要与现有正式站同时占用 4001；命名卷的删除是永久数据破坏，不要使用 `down -v` 清理线上服务。
 
 Linux x86_64 / Python3.12可使用 `requirements-linux-x86_64.lock` 的哈希锁；其他架构按 `requirements.txt` 安装并为该平台重新生成hash锁。CSS为仓库内静态构建产物，运行时无需Node或Tailwind CDN；重新构建用 `npm ci --ignore-scripts && npm run build:css`。
 
