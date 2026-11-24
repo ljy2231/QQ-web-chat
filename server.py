@@ -3,7 +3,8 @@ import signal
 from pathlib import Path
 from webchat.storage import AsyncStore, RevisionConflict, StorageBusy
 from webchat.auth import (SessionManager, SafeAccessLogger, CredentialStore,
-                          json_object, load_credentials, make_setup_handler)
+                          json_object, load_credentials, make_setup_handler,
+                          make_change_password_handler)
 from webchat.resources import DiskBudget, io_safely
 from webchat.http_security import security_middleware, response_headers
 from webchat.messaging import (conversation_key, parse_target, normalize_segments,
@@ -54,6 +55,7 @@ DEFAULT_SETTINGS = {
 settings = dict(DEFAULT_SETTINGS)
 ADMIN_QQ_ID = os.environ.get("ADMIN_QQ_ID", "")
 EXPECTED_TOKEN = os.environ.get("NAPCAT_ACCESS_TOKEN", "")
+SETUP_TOKEN = os.environ.get("SETUP_TOKEN", "")
 # ====================================================
 
 DATA_FILE = os.path.join(DATA_DIR, "chat_data.json")
@@ -67,13 +69,25 @@ CREDENTIALS_FILE = os.path.join(DATA_DIR, 'credentials.json')
 SETUP_TOKEN_FILE = os.path.join(DATA_DIR, 'setup-token')
 credential_store = CredentialStore(CREDENTIALS_FILE)
 stored_credentials = credential_store.load()
-sessions = SessionManager(
-    '' if stored_credentials else WEB_PASSWORD,
-    username=stored_credentials.username if stored_credentials else os.environ.get('WEB_USERNAME', ''),
-    password_hash=stored_credentials.password_hash if stored_credentials else None,
-    setup_token=os.environ.get('SETUP_TOKEN', ''),
-    public_base_url=PUBLIC_BASE_URL,
-    trusted_proxies=tuple(x.strip() for x in os.environ.get('TRUSTED_PROXIES', '').split(',') if x.strip()))
+if stored_credentials:
+    sessions = SessionManager('', username=stored_credentials.username,
+                              password_hash=stored_credentials.password_hash,
+                              must_change_password=stored_credentials.must_change,
+                              setup_token=SETUP_TOKEN, public_base_url=PUBLIC_BASE_URL,
+                              trusted_proxies=tuple(x.strip() for x in os.environ.get('TRUSTED_PROXIES', '').split(',') if x.strip()))
+elif WEB_PASSWORD:
+    sessions = SessionManager(WEB_PASSWORD, username=os.environ.get('WEB_USERNAME', ''),
+                              setup_token=SETUP_TOKEN, public_base_url=PUBLIC_BASE_URL,
+                              trusted_proxies=tuple(x.strip() for x in os.environ.get('TRUSTED_PROXIES', '').split(',') if x.strip()))
+elif SETUP_TOKEN:
+    # One-click bootstrap: admin + printed token, must change on first login.
+    sessions = SessionManager(SETUP_TOKEN, username='admin', must_change_password=True,
+                              setup_token='', public_base_url=PUBLIC_BASE_URL,
+                              trusted_proxies=tuple(x.strip() for x in os.environ.get('TRUSTED_PROXIES', '').split(',') if x.strip()))
+else:
+    sessions = SessionManager('', username=os.environ.get('WEB_USERNAME', ''),
+                              setup_token=SETUP_TOKEN, public_base_url=PUBLIC_BASE_URL,
+                              trusted_proxies=tuple(x.strip() for x in os.environ.get('TRUSTED_PROXIES', '').split(',') if x.strip()))
 store = None
 background_tasks = set()
 shutdown_event = asyncio.Event()
@@ -1504,6 +1518,7 @@ def create_app():
     app.on_shutdown.append(shutdown_transports)
     sessions.install(app)
     app.router.add_post('/api/setup', make_setup_handler(sessions, credential_store))
+    app.router.add_post('/api/change-password', make_change_password_handler(sessions, credential_store))
     app.router.add_get('/healthz', health_handler)
     app.router.add_get('/readyz', ready_handler)
     app.router.add_get('/ws', napcat_ws_handler)

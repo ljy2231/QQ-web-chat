@@ -16,7 +16,7 @@ from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from webchat.auth import (COOKIE_NAME, CredentialStore, LoginRateLimiter, SafeAccessLogger,
                           SessionManager, json_object, load_credentials,
-                          make_setup_handler, validate_client_message)
+                          make_change_password_handler, make_setup_handler, validate_client_message)
 
 PASSWORD = "synthetic-test-only-password"
 
@@ -460,6 +460,45 @@ class SetupFlowTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post("/api/login", json={"password": "synthetic-pass-123"},
                                           headers={"Origin": self.origin})
         self.assertEqual(response.status, 401)
+
+    async def test_default_admin_token_forces_password_change_then_persists(self):
+        manager = SessionManager("synthetic-bootstrap-token", username="admin",
+                                 must_change_password=True)
+        store = CredentialStore(os.path.join(self.temp.name, "bootstrap.json"))
+        app = web.Application()
+        manager.install(app)
+        app.router.add_post("/api/change-password", make_change_password_handler(manager, store))
+        client = TestClient(TestServer(app), cookie_jar=aiohttp.CookieJar(unsafe=True))
+        await client.start_server()
+        origin = str(client.make_url("/")).rstrip("/")
+        try:
+            response = await client.post("/api/login", json={"username": "admin",
+                                                             "password": "synthetic-bootstrap-token"},
+                                         headers={"Origin": origin})
+            self.assertEqual(response.status, 200)
+            body = await response.json()
+            self.assertTrue(body["must_change_password"])
+            response = await client.post("/api/change-password",
+                                         json={"current_password": "synthetic-bootstrap-token",
+                                               "new_password": "synthetic-new-pass-123"},
+                                         headers={"Origin": origin})
+            self.assertEqual(response.status, 200)
+            self.assertFalse(manager.must_change_password)
+            stored = store.load()
+            self.assertEqual(stored.username, "admin")
+            self.assertFalse(stored.must_change)
+            await client.post("/api/logout", json={}, headers={"Origin": origin})
+            response = await client.post("/api/login", json={"username": "admin",
+                                                             "password": "synthetic-new-pass-123"},
+                                         headers={"Origin": origin})
+            self.assertEqual(response.status, 200)
+            self.assertFalse((await response.json())["must_change_password"])
+            response = await client.post("/api/login", json={"username": "admin",
+                                                             "password": "synthetic-bootstrap-token"},
+                                         headers={"Origin": origin})
+            self.assertEqual(response.status, 401)
+        finally:
+            await client.close()
 
     async def test_setup_without_configured_token_is_rejected(self):
         manager = SessionManager()

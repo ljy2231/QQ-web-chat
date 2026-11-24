@@ -45,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/ljy2231/QQ-web-chat/main/deploy/ins
 curl -fsSL https://hub.002230.xyz:44300/https://raw.githubusercontent.com/ljy2231/QQ-web-chat/main/deploy/install-cn.sh | bash
 ```
 
-默认安装到 `/opt/qq-webchat`，数据在 `/opt/qq-webchat/data`，配置在 `.env`（0600）。脚本生成一次性 `SETUP_TOKEN` 与 NapCat 连接令牌，拉取镜像并启动，最后打印初始化链接。默认仅监听 `127.0.0.1:4001`；重复执行保留数据和令牌并重建 `compose.yaml`。可用 `QQWEBCHAT_DIR`、`QQWEBCHAT_PORT`、`QQWEBCHAT_BIND`、`PUBLIC_BASE_URL`、`TRUSTED_PROXIES` 覆盖。首次打开网页设置登录账号和密码，密码只保存为 `data/credentials.json` 的哈希；该链接只能使用一次。不要在初始化完成前把服务暴露到公网。
+默认安装到 `/opt/qq-webchat`，数据在 `/opt/qq-webchat/data`，配置在 `.env`（0600）。脚本生成初始化 Token 与 NapCat 连接令牌，拉取镜像并启动，最后打印默认账号 `admin`、初始密码（初始化 Token）和登录地址。默认仅监听 `127.0.0.1:4001`；重复执行保留数据和令牌并重建 `compose.yaml`。可用 `QQWEBCHAT_DIR`、`QQWEBCHAT_PORT`、`QQWEBCHAT_BIND`、`PUBLIC_BASE_URL`、`TRUSTED_PROXIES` 覆盖。首次用 `admin` + 初始化 Token 登录，页面强制修改密码；密码只保存为 `data/credentials.json` 的哈希，改完不再提示。不要在初始化完成前把服务暴露到公网。
 
 手动部署（源码）：
 
@@ -57,9 +57,10 @@ docker compose up -d --build
 
 ### 首次初始化与重置
 
-- 初始化链接：`http://<地址>:4001/web?setup=<SETUP_TOKEN>`；口令在 `/opt/qq-webchat/.env` 的 `SETUP_TOKEN`，或数据目录的 `setup-token`。
-- 初始化完成后再次调用 `/api/setup` 会被拒绝（409）。
-- 忘记账号：删除数据目录中的 `credentials.json` 后重启；**不要删除 data 目录**，否则聊天数据一起丢失。示例：
+- 默认账号：`admin`；初始密码：`/opt/qq-webchat/.env` 的 `SETUP_TOKEN`。首次登录会强制改密。
+- 无 `SETUP_TOKEN` 的旧式初始化才会使用 `http://<地址>:4001/web?setup=...`；口令在数据目录的 `setup-token`。
+- 修改密码后写入 `data/credentials.json`；再次初始化会被拒绝（409）。
+- 忘记密码：删除数据目录中的 `credentials.json` 后重启，会恢复为 `admin` + 初始化 Token 并再次强制改密；**不要删除 data 目录**，否则聊天数据一起丢失。示例：
 
 ```sh
 docker compose -f /opt/qq-webchat/compose.yaml -p qq-webchat stop

@@ -353,4 +353,19 @@ test('NR sends the configured username when logging in',()=>{
  const login=h.requests[h.requests.length-1];
  assert.deepEqual(JSON.parse(login.body),{username:'admin',password:'synthetic-pass'});
 });
+test('main default admin login forces a password change before entering',()=>{
+ const h=harness('main');
+ h.run("loginUser.value='admin';loginPwd.value='initial-token';doLogin()");
+ let req=h.requests[h.requests.length-1];
+ assert.deepEqual(JSON.parse(req.body),{username:'admin',password:'initial-token'});
+ req.respond(200,{status:'ok',must_change_password:true,username:'admin'});
+ assert.equal(h.run('lastLoginPassword'),'initial-token');
+ assert.equal(h.nodes['change-current'].value,'initial-token');
+ h.run("changePwd.value='new-password-123';changePwd2.value='new-password-123';doChange()");
+ req=h.requests[h.requests.length-1];
+ assert.equal(req.url,'/api/change-password');
+ assert.deepEqual(JSON.parse(req.body),{current_password:'initial-token',new_password:'new-password-123'});
+ req.respond(200,{ok:true});
+ assert.equal(h.nodes['login-overlay'].style.display,'none');
+});
 console.log('PASS '+count+' synthetic frontend tests (no browser/device assertions)');

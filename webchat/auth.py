@@ -183,6 +183,7 @@ class StoredCredentials:
     username: str
     password_hash: str
     created_at: float
+    must_change: bool = False
 
 
 class CredentialStore:
@@ -204,20 +205,23 @@ class CredentialStore:
         if not isinstance(data, dict) or data.get("version") != 1:
             raise ValueError("credential file is invalid")
         username, digest, created = data.get("username"), data.get("password_hash"), data.get("created_at")
+        must_change = data.get("must_change", False)
         if not isinstance(username, str) or not USERNAME_PATTERN.fullmatch(username):
             raise ValueError("credential file is invalid")
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ValueError("credential file is invalid")
         if not isinstance(created, (int, float)) or isinstance(created, bool) or created <= 0:
             raise ValueError("credential file is invalid")
-        return StoredCredentials(username, digest, float(created))
+        if not isinstance(must_change, bool):
+            raise ValueError("credential file is invalid")
+        return StoredCredentials(username, digest, float(created), must_change)
 
-    def save(self, username, password):
+    def save(self, username, password, *, must_change=False):
         if not USERNAME_PATTERN.fullmatch(username or ""):
             raise ValueError("invalid username")
         digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
         payload = json.dumps({"version": 1, "username": username, "password_hash": digest,
-                              "created_at": time.time()}).encode("utf-8")
+                              "created_at": time.time(), "must_change": bool(must_change)}).encode("utf-8")
         directory = os.path.dirname(self.path)
         os.makedirs(directory, mode=0o700, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix=".credentials-", dir=directory)
@@ -239,7 +243,7 @@ class CredentialStore:
             except FileNotFoundError:
                 pass
             raise
-        return StoredCredentials(username, digest, time.time())
+        return StoredCredentials(username, digest, time.time(), bool(must_change))
 
 
 @dataclass(eq=False)
@@ -289,7 +293,7 @@ class LoginRateLimiter:
 
 class SessionManager:
     def __init__(self, password="", *, username="", password_hash=None, setup_token="",
-                 public_base_url="", trusted_proxies=(),
+                 must_change_password=False, public_base_url="", trusted_proxies=(),
                  absolute_ttl=86400, idle_ttl=3600, max_sessions=128,
                  max_resources_per_session=16, per_ip_limit=10, global_login_limit=60,
                  login_window=60, max_login_ips=1024, sweep_interval=1,
@@ -306,6 +310,7 @@ class SessionManager:
         self._password_hash = password_hash or (hashlib.sha256(password.encode()).hexdigest() if password else None)
         self.username = username or ""
         self.setup_token = setup_token or ""
+        self.must_change_password = bool(must_change_password) and self._password_hash is not None
         self.public_base_url = public_base_url.rstrip("/")
         self.public_origin = _origin(public_base_url) if public_base_url else None
         if self.public_origin and self.public_origin[0] != "https" and not _loopback(self.public_origin[1]):
@@ -326,7 +331,7 @@ class SessionManager:
         return bool(self.setup_token and isinstance(token, str) and
                     secrets.compare_digest(token, self.setup_token))
 
-    def set_credentials(self, username, *, password=None, password_hash=None):
+    def set_credentials(self, username, *, password=None, password_hash=None, must_change_password=False):
         if not USERNAME_PATTERN.fullmatch(username or ""):
             raise ValueError("invalid username")
         if password_hash is None:
@@ -336,6 +341,12 @@ class SessionManager:
             raise ValueError("invalid password hash")
         self.username = username
         self._password_hash = password_hash
+        self.must_change_password = bool(must_change_password)
+
+    def check_password(self, password):
+        if not self.initialized or not isinstance(password, str) or not password:
+            return False
+        return secrets.compare_digest(hashlib.sha256(password.encode()).hexdigest(), self._password_hash)
 
     def _trusted(self, value):
         try:
@@ -522,7 +533,9 @@ class SessionManager:
             return web.json_response({"status": "error", "error": "invalid credentials"}, status=401,
                                      headers={"Cache-Control": "no-store"})
         session = await self.issue()
-        return self._cookie(web.json_response({"status": "ok", "token": session.token}), request, session)
+        return self._cookie(web.json_response({"status": "ok", "token": session.token,
+                                               "username": self.username,
+                                               "must_change_password": self.must_change_password}), request, session)
 
     async def logout_handler(self, request):
         session = self.require(request, touch=False)
@@ -543,7 +556,8 @@ class SessionManager:
                                      headers={"Cache-Control": "no-store"})
         # Old Android WebViews omit cookies on WebSocket upgrades, so an already
         # authenticated same-origin page may use this token for the WS handshake.
-        return web.json_response({"authenticated": True, "ws_token": session.token},
+        return web.json_response({"authenticated": True, "ws_token": session.token,
+                                  "must_change_password": self.must_change_password},
                                  headers={"Cache-Control": "no-store"})
 
     async def restore_handler(self, request):
@@ -622,6 +636,40 @@ def make_setup_handler(manager, store):
         return manager._cookie(web.json_response({"ok": True, "username": stored.username,
                                                   "token": session.token}), request, session)
     return setup_handler
+
+
+def make_change_password_handler(manager, store):
+    """Change the web password after a default-token or forced-change login."""
+    async def change_handler(request):
+        manager.check_transport(request)
+        manager.check_origin(request, required=True)
+        if not manager.limiter.allow(manager.client_ip(request)):
+            response = web.json_response({"error": "too many password attempts"}, status=429,
+                                         headers={"Cache-Control": "no-store"})
+            response.headers["Retry-After"] = str(int(manager.limiter.window) + 1)
+            return response
+        manager.require(request, touch=True)
+        data = await json_object(request, 8192)
+        new_password = bounded_string(data.get("new_password"), "new_password", maximum=4096, required=True)
+        current = bounded_string(data.get("current_password"), "current_password", maximum=4096)
+        if not manager.must_change_password and not manager.check_password(current):
+            return web.json_response({"error": "current password is incorrect"}, status=403,
+                                     headers={"Cache-Control": "no-store"})
+        try:
+            validate_new_password(new_password)
+            stored = store.save(manager.username or "admin", new_password, must_change=False)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400,
+                                     headers={"Cache-Control": "no-store"})
+        except OSError:
+            logging.getLogger(__name__).error("credential storage unavailable")
+            return web.json_response({"error": "credential storage unavailable"}, status=503,
+                                     headers={"Cache-Control": "no-store"})
+        manager.set_credentials(stored.username, password_hash=stored.password_hash,
+                                must_change_password=False)
+        return web.json_response({"ok": True, "username": stored.username},
+                                 headers={"Cache-Control": "no-store"})
+    return change_handler
 
 
 class SafeAccessLogger(AbstractAccessLogger):

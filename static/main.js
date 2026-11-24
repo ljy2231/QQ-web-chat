@@ -9,6 +9,7 @@ let ws = null;
 
             let authToken = null; // Session-generation marker only; never a bearer credential.
             let store = new ChatCore.Store();
+            let lastLoginPassword = '';
             let connection = null, historyTimer = null, sessionRequest = null, setupRequest = null;
             let previewBlobURL = null, composing = false;
             try { localStorage.removeItem('webchat_token'); } catch (e) {}
@@ -45,6 +46,12 @@ let ws = null;
             const setupToken = document.getElementById('setup-token');
             const setupBtn = document.getElementById('setup-btn');
             const setupError = document.getElementById('setup-error');
+            const changeCard = document.getElementById('change-card');
+            const changeCurrent = document.getElementById('change-current');
+            const changePwd = document.getElementById('change-pwd');
+            const changePwd2 = document.getElementById('change-pwd2');
+            const changeBtn = document.getElementById('change-btn');
+            const changeError = document.getElementById('change-error');
             const loginBtn = document.getElementById('login-btn');
             const loginError = document.getElementById('login-error');
             const logoutBtn = document.getElementById('logout-btn');
@@ -516,6 +523,7 @@ let ws = null;
                 authToken = ChatCore.id();
                 loginPwd.value = ''; loginError.classList.add('hidden');
                 if (setupCard) setupCard.classList.add('hidden');
+                if (changeCard) changeCard.classList.add('hidden');
                 loginOverlay.style.display = 'none'; updateWallpaperView();
                 resetSettingsCache(); loadSettings(); connect();
             }
@@ -531,10 +539,41 @@ let ws = null;
             }
             function showLogin() {
                 if (setupCard) setupCard.classList.add('hidden');
+                if (changeCard) changeCard.classList.add('hidden');
                 if (loginCard) loginCard.classList.remove('hidden');
+            }
+            function showChange(currentPassword) {
+                if (loginCard) loginCard.classList.add('hidden');
+                if (setupCard) setupCard.classList.add('hidden');
+                if (!changeCard) return;
+                changeCard.classList.remove('hidden');
+                if (changeCurrent) changeCurrent.value = currentPassword || '';
+                if (changePwd) changePwd.value = '';
+                if (changePwd2) changePwd2.value = '';
+                if (changeError) changeError.classList.add('hidden');
+                if (changeBtn) { changeBtn.disabled = false; changeBtn.innerText = '保存新密码并进入'; }
+            }
+            function changeFailure(text) {
+                if (!changeError) { showToast(text); return; }
+                changeError.innerText = text; changeError.classList.remove('hidden');
+            }
+            function doChange() {
+                const current = (changeCurrent && changeCurrent.value) || lastLoginPassword || '';
+                const next = (changePwd && changePwd.value) || '';
+                if (next.length < 8) { changeFailure('新密码至少 8 位'); return; }
+                if (next !== (changePwd2 && changePwd2.value || '')) { changeFailure('两次输入的新密码不一致'); return; }
+                if (changeBtn) { changeBtn.disabled = true; changeBtn.innerText = '保存中...'; }
+                ChatCore.request('POST', '/api/change-password', {current_password: current, new_password: next}, function(status, data) {
+                    if (changeBtn) { changeBtn.disabled = false; changeBtn.innerText = '保存新密码并进入'; }
+                    if (status === 200) { lastLoginPassword = ''; enterSession(); return; }
+                    if (status === 403) { changeFailure('当前密码不正确'); return; }
+                    if (status === 400 && data && data.error) { changeFailure(data.error); return; }
+                    changeFailure(status === 0 ? '保存超时或网络异常，请重试' : '保存失败，请稍后重试');
+                });
             }
             function showSetup(token) {
                 if (loginCard) loginCard.classList.add('hidden');
+                if (changeCard) changeCard.classList.add('hidden');
                 if (!setupCard) return;
                 setupCard.classList.remove('hidden');
                 if (setupUser) setupUser.value = 'admin';
@@ -578,7 +617,10 @@ let ws = null;
                 sessionRequest = ChatCore.request('POST', '/api/login', {username: username, password: loginPwd.value}, function(status, data) {
                     if (loginBtn.dataset.request !== marker) return;
                     sessionRequest = null; loginBtn.disabled = false; loginBtn.innerText = '登录';
-                    if (status === 200) enterSession();
+                    if (status === 200) {
+                        if (data && data.must_change_password) { lastLoginPassword = loginPwd.value; showChange(loginPwd.value); }
+                        else enterSession();
+                    }
                     else if (status === 409 && data && data.setup_required) { showSetup(setupTokenFromUrl()); }
                     else { loginError.classList.remove('hidden'); loginError.innerText = status === 0 ? '登录超时或网络错误，请重试' : '登录失败，请检查账号密码或稍后重试'; }
                 });
@@ -628,6 +670,11 @@ let ws = null;
             if (downloadBgBtn) downloadBgBtn.addEventListener('click', saveCurrentWallpaper);
             loginBtn.addEventListener('click', doLogin);
             if (setupBtn) setupBtn.addEventListener('click', doSetup);
+            if (changeBtn) changeBtn.addEventListener('click', doChange);
+            [changeCurrent, changePwd, changePwd2].forEach(function(input) {
+                if (!input) return;
+                input.addEventListener('keydown', function(e) { if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) doChange(); });
+            });
             [setupUser, setupPwd, setupPwd2, setupToken].forEach(function(input) {
                 if (!input) return;
                 input.addEventListener('keydown', function(e) { if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) doSetup(); });
@@ -639,7 +686,10 @@ let ws = null;
                 sessionRequest = ChatCore.request('GET', '/api/session', null, function(status, data) {
                     if (loginBtn.dataset.request !== marker) return;
                     sessionRequest = null;
-                    if (status === 200 && data && data.authenticated) enterSession();
+                    if (status === 200 && data && data.authenticated) {
+                        if (data.must_change_password) { lastLoginPassword = ''; showChange(''); }
+                        else enterSession();
+                    }
                     else if (status === 401 && data && data.setup_required) showSetup(setupTokenFromUrl());
                     else if (status === 0) { loginError.classList.remove('hidden'); loginError.innerText = '会话检查超时，请重新登录'; }
                 });
