@@ -150,13 +150,13 @@ body.theme-dark .sent-check { color: #86efac; }
                 <button id="retry-logout" type="button" hidden class="w-full text-sm mt-3 text-gray-600">重试注销</button>
             </div>
             <div id="setup-card" class="relative z-10 bg-white p-8 rounded-2xl shadow-xl w-full max-w-md border border-gray-200 hidden">
-                <h2 class="text-2xl font-bold text-center text-gray-800 mb-2">初始化管理员</h2>
-                <p class="text-xs text-gray-500 text-center mb-5">首次使用，请设置登录账号和密码；设置完成后会自动登录。</p>
+                <h2 class="text-2xl font-bold text-center text-gray-800 mb-2">首次进入：强制设置密码</h2>
+                <p class="text-xs text-gray-500 text-center mb-5">首次使用必须设置登录账号和新密码；提交后自动登录，之后不再提示改密。</p>
                 <input type="text" id="setup-user" value="admin" autocomplete="username" class="w-full border border-gray-300 rounded-lg px-4 py-3 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200 transition-all mb-3" placeholder="登录账号（3-32 位字母/数字/._-）">
-                <input type="password" id="setup-pwd" autocomplete="new-password" class="w-full border border-gray-300 rounded-lg px-4 py-3 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200 transition-all mb-3" placeholder="密码（至少 8 位）">
-                <input type="password" id="setup-pwd2" autocomplete="new-password" class="w-full border border-gray-300 rounded-lg px-4 py-3 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200 transition-all mb-3" placeholder="再次输入密码">
+                <input type="password" id="setup-pwd" autocomplete="new-password" class="w-full border border-gray-300 rounded-lg px-4 py-3 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200 transition-all mb-3" placeholder="新密码（至少 8 位）">
+                <input type="password" id="setup-pwd2" autocomplete="new-password" class="w-full border border-gray-300 rounded-lg px-4 py-3 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200 transition-all mb-3" placeholder="再次输入新密码">
                 <input type="text" id="setup-token" autocomplete="off" class="w-full border border-gray-300 rounded-lg px-4 py-3 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200 transition-all mb-4" placeholder="初始化口令（部署脚本输出链接中自动填写）">
-                <button id="setup-btn" class="w-full bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 rounded-lg transition-colors">创建账号并进入</button>
+                <button id="setup-btn" class="w-full bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 rounded-lg transition-colors">设置新密码并进入</button>
                 <p id="setup-error" class="text-red-500 text-sm mt-3 text-center hidden" role="status"></p>
             </div>
         </div>
@@ -245,7 +245,7 @@ body.theme-dark .sent-check { color: #86efac; }
         </div>
 
         <script src="/static/chat-core.js"></script>
-<script src="/static/main.js?v=setup-1" defer></script>
+<script src="/static/main.js?v=setup-2" defer></script>
 
         <div id="settings-modal" class="fixed inset-0 z-[10000] hidden">
             <div class="absolute inset-0 bg-black/40" id="settings-mask"></div>

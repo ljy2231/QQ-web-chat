@@ -542,7 +542,7 @@ let ws = null;
                 if (setupPwd2) setupPwd2.value = '';
                 if (setupToken) setupToken.value = token || '';
                 if (setupError) setupError.classList.add('hidden');
-                if (setupBtn) { setupBtn.disabled = false; setupBtn.innerText = '创建账号并进入'; }
+                if (setupBtn) { setupBtn.disabled = false; setupBtn.innerText = '设置新密码并进入'; }
             }
             function setupFailure(text) {
                 if (!setupError) { showToast(text); return; }
@@ -557,10 +557,10 @@ let ws = null;
                 if (password.length < 8) { setupFailure('密码至少 8 位'); return; }
                 if (password !== (setupPwd2 && setupPwd2.value || '')) { setupFailure('两次输入的密码不一致'); return; }
                 if (setupRequest) { setupRequest.abort(); setupRequest = null; }
-                if (setupBtn) { setupBtn.disabled = true; setupBtn.innerText = '创建中...'; }
+                if (setupBtn) { setupBtn.disabled = true; setupBtn.innerText = '设置中...'; }
                 setupRequest = ChatCore.request('POST', '/api/setup', {token: token, username: username, password: password}, function(status, data) {
                     setupRequest = null;
-                    if (setupBtn) { setupBtn.disabled = false; setupBtn.innerText = '创建账号并进入'; }
+                    if (setupBtn) { setupBtn.disabled = false; setupBtn.innerText = '设置新密码并进入'; }
                     if (status === 200) { clearSetupQuery(); enterSession(); return; }
                     if (status === 409) { showLogin(); loginError.classList.remove('hidden'); loginError.innerText = '已完成初始化，请直接登录'; return; }
                     if (status === 403) { setupFailure('初始化口令不正确或已失效'); return; }

@@ -190,9 +190,10 @@ else
 fi
 
 SESSION_JSON="$(curl -sS --max-time 5 "${PROBE}/api/session" 2>/dev/null || true)"
-if printf '%s' "$SESSION_JSON" | grep -q '"setup_required": *true'; then
-  say "   首次设置 : ${BASE_URL}/web?setup=${SETUP_TOKEN}"
-  say "   （一次性链接，设置登录账号和密码后自动登录；请勿分享）"
+if (( READY == 0 )) || printf '%s' "$SESSION_JSON" | grep -q '"setup_required": *true'; then
+  say "   初始化 Token : ${SETUP_TOKEN}"
+  say "   首次设置链接 : ${BASE_URL}/web?setup=${SETUP_TOKEN}"
+  say "   （一次性链接；进入后强制设置登录账号和新密码，提交后自动登录，之后不再提示改密）"
 else
   say "   访问地址 : ${BASE_URL}/web"
   say "   该实例已初始化，请使用之前的账号密码登录。"

@@ -22,7 +22,7 @@ curl -fsSL https://hub.002230.xyz:44300/https://raw.githubusercontent.com/ljy223
 curl -fsSL https://raw.githubusercontent.com/ljy2231/QQ-web-chat/main/deploy/install.sh | bash
 ```
 
-脚本会自动生成一次性初始化口令和 NapCat 连接令牌、创建数据目录、拉取镜像并启动容器，最后打印访问地址与首次设置链接。默认安装目录 `/opt/qq-webchat`，端口 `4001`，仅监听 `127.0.0.1`；重复执行会保留 `.env`、数据与令牌，并重新生成 Compose 文件。若 `4001` 已被占用（例如本机已有 systemd 版本），用 `QQWEBCHAT_PORT=4002` 重跑，不要让两个实例共用同一数据目录。
+脚本会自动生成一次性初始化口令和 NapCat 连接令牌、创建数据目录、拉取镜像并启动容器，最后直接打印初始化 Token、访问地址与首次设置链接。默认安装目录 `/opt/qq-webchat`，端口 `4001`，仅监听 `127.0.0.1`；重复执行会保留 `.env`、数据与令牌，并重新生成 Compose 文件。若 `4001` 已被占用（例如本机已有 systemd 版本），用 `QQWEBCHAT_PORT=4002` 重跑，不要让两个实例共用同一数据目录。
 
 打开脚本输出的链接，在网页中设置登录账号和密码即可（命令行不需要输入账号密码）。NapCat 需要使用 `.env` 中的 `NAPCAT_ACCESS_TOKEN`；脚本不会修改 NapCat。
 
